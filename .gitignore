@@ -1,0 +1,16 @@
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+results/ppo/
+results/*.png
+!results/baseline_1w_summary.yaml
+!results/baseline_1w_exogenous.yaml
+
+*.log
+*.tmp
+*.swp
+*.swo

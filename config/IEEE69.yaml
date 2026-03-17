@@ -1,0 +1,145 @@
+baseMVA: 10.0
+
+buses:
+  - { bus_i: 1,  type: SLACK, Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.0, Vmin: 1.0 }
+  - { bus_i: 2,  type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 3,  type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 4,  type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 5,  type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 6,  type: PQ,    Pd: 26.0,  Qd: 22.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 7,  type: PQ,    Pd: 40.4,  Qd: 30.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 8,  type: PQ,    Pd: 75.0,  Qd: 54.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 9,  type: PQ,    Pd: 30.0,  Qd: 22.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 10, type: PQ,    Pd: 28.0,  Qd: 19.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 11, type: PQ,    Pd: 145.0, Qd: 104.0, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 12, type: PQ,    Pd: 145.0, Qd: 104.0, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 13, type: PQ,    Pd: 8.0,   Qd: 5.5,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 14, type: PQ,    Pd: 8.0,   Qd: 5.5,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 15, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 16, type: PQ,    Pd: 45.5,  Qd: 30.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 17, type: PQ,    Pd: 60.0,  Qd: 35.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 18, type: PQ,    Pd: 60.0,  Qd: 35.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 19, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 20, type: PQ,    Pd: 1.0,   Qd: 0.6,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 21, type: PQ,    Pd: 114.0, Qd: 81.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 22, type: PQ,    Pd: 5.3,   Qd: 3.5,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 23, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 24, type: PQ,    Pd: 28.0,  Qd: 20.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 25, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 26, type: PQ,    Pd: 14.0,  Qd: 10.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 27, type: PQ,    Pd: 14.0,  Qd: 10.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 28, type: PQ,    Pd: 26.0,  Qd: 18.6,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 29, type: PQ,    Pd: 26.0,  Qd: 18.6,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 30, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 31, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 32, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 33, type: PQ,    Pd: 14.0,  Qd: 10.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 34, type: PQ,    Pd: 19.5,  Qd: 14.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 35, type: PQ,    Pd: 6.0,   Qd: 4.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 36, type: PQ,    Pd: 26.0,  Qd: 18.6,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 37, type: PQ,    Pd: 26.0,  Qd: 18.6,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 38, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 39, type: PQ,    Pd: 24.0,  Qd: 17.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 40, type: PQ,    Pd: 24.0,  Qd: 17.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 41, type: PQ,    Pd: 1.2,   Qd: 1.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 42, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 43, type: PQ,    Pd: 6.0,   Qd: 4.3,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 44, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 45, type: PQ,    Pd: 39.2,  Qd: 26.3,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 46, type: PQ,    Pd: 39.2,  Qd: 26.3,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 47, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 48, type: PQ,    Pd: 79.0,  Qd: 56.4,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 49, type: PQ,    Pd: 384.7, Qd: 274.5, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 50, type: PQ,    Pd: 384.7, Qd: 274.5, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 51, type: PQ,    Pd: 40.5,  Qd: 28.3,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 52, type: PQ,    Pd: 3.6,   Qd: 2.7,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 53, type: PQ,    Pd: 4.3,   Qd: 3.5,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 54, type: PQ,    Pd: 26.4,  Qd: 19.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 55, type: PQ,    Pd: 24.0,  Qd: 17.2,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 56, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 57, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 58, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 59, type: PQ,    Pd: 100.0, Qd: 72.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 60, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 61, type: PQ,    Pd: 1244.0,Qd: 888.0, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 62, type: PQ,    Pd: 32.0,  Qd: 23.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 63, type: PQ,    Pd: 0.0,   Qd: 0.0,   Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 64, type: PQ,    Pd: 227.0, Qd: 162.0, Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 65, type: PQ,    Pd: 59.0,  Qd: 42.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 66, type: PQ,    Pd: 18.0,  Qd: 13.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 67, type: PQ,    Pd: 18.0,  Qd: 13.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 68, type: PQ,    Pd: 28.0,  Qd: 20.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+  - { bus_i: 69, type: PQ,    Pd: 28.0,  Qd: 20.0,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
+
+generators:
+  - { gen_i: 1, bus_i: 1, status: 1, Pg: 0.0, Qg: 0.0, Pmax: 10.0, Pmin: 0.0, Qmax: 10.0, Qmin: -10.0, cost_c2: 0.001, cost_c1: 2.0, cost_c0: 20.0 }
+
+branches:
+  - { branch_i: 1,  f_bus: 1,  t_bus: 2,  r: 0.0005, x: 0.0012, rateA: 10.0, status: 1 }
+  - { branch_i: 2,  f_bus: 2,  t_bus: 3,  r: 0.0005, x: 0.0012, rateA: 10.0, status: 1 }
+  - { branch_i: 3,  f_bus: 3,  t_bus: 4,  r: 0.0015, x: 0.0036, rateA: 10.0, status: 1 }
+  - { branch_i: 4,  f_bus: 4,  t_bus: 5,  r: 0.0251, x: 0.0294, rateA: 10.0, status: 1 }
+  - { branch_i: 5,  f_bus: 5,  t_bus: 6,  r: 0.366,  x: 0.1864, rateA: 10.0, status: 1 }
+  - { branch_i: 6,  f_bus: 6,  t_bus: 7,  r: 0.381,  x: 0.1941, rateA: 10.0, status: 1 }
+  - { branch_i: 7,  f_bus: 7,  t_bus: 8,  r: 0.0922, x: 0.047,  rateA: 10.0, status: 1 }
+  - { branch_i: 8,  f_bus: 8,  t_bus: 9,  r: 0.0493, x: 0.0251, rateA: 10.0, status: 1 }
+  - { branch_i: 9,  f_bus: 9,  t_bus: 10, r: 0.819,  x: 0.2707, rateA: 10.0, status: 1 }
+  - { branch_i: 10, f_bus: 10, t_bus: 11, r: 0.1872, x: 0.0619, rateA: 10.0, status: 1 }
+  - { branch_i: 11, f_bus: 11, t_bus: 12, r: 0.7114, x: 0.2351, rateA: 10.0, status: 1 }
+  - { branch_i: 12, f_bus: 12, t_bus: 13, r: 1.03,   x: 0.34,   rateA: 10.0, status: 1 }
+  - { branch_i: 13, f_bus: 13, t_bus: 14, r: 1.044,  x: 0.34,   rateA: 10.0, status: 1 }
+  - { branch_i: 14, f_bus: 14, t_bus: 15, r: 1.058,  x: 0.3496, rateA: 10.0, status: 1 }
+  - { branch_i: 15, f_bus: 15, t_bus: 16, r: 0.1966, x: 0.065,  rateA: 10.0, status: 1 }
+  - { branch_i: 16, f_bus: 16, t_bus: 17, r: 0.3744, x: 0.1238, rateA: 10.0, status: 1 }
+  - { branch_i: 17, f_bus: 17, t_bus: 18, r: 0.0047, x: 0.0016, rateA: 10.0, status: 1 }
+  - { branch_i: 18, f_bus: 18, t_bus: 19, r: 0.3276, x: 0.1083, rateA: 10.0, status: 1 }
+  - { branch_i: 19, f_bus: 19, t_bus: 20, r: 0.2106, x: 0.069,  rateA: 10.0, status: 1 }
+  - { branch_i: 20, f_bus: 20, t_bus: 21, r: 0.3416, x: 0.1129, rateA: 10.0, status: 1 }
+  - { branch_i: 21, f_bus: 21, t_bus: 22, r: 0.014,  x: 0.0046, rateA: 10.0, status: 1 }
+  - { branch_i: 22, f_bus: 22, t_bus: 23, r: 0.1591, x: 0.0526, rateA: 10.0, status: 1 }
+  - { branch_i: 23, f_bus: 23, t_bus: 24, r: 0.3463, x: 0.1145, rateA: 10.0, status: 1 }
+  - { branch_i: 24, f_bus: 24, t_bus: 25, r: 0.7488, x: 0.2475, rateA: 10.0, status: 1 }
+  - { branch_i: 25, f_bus: 25, t_bus: 26, r: 0.3089, x: 0.1021, rateA: 10.0, status: 1 }
+  - { branch_i: 26, f_bus: 26, t_bus: 27, r: 0.1732, x: 0.0572, rateA: 10.0, status: 1 }
+  - { branch_i: 27, f_bus: 3,  t_bus: 28, r: 0.0044, x: 0.0108, rateA: 10.0, status: 1 }
+  - { branch_i: 28, f_bus: 28, t_bus: 29, r: 0.064,  x: 0.1565, rateA: 10.0, status: 1 }
+  - { branch_i: 29, f_bus: 29, t_bus: 30, r: 0.3978, x: 0.1315, rateA: 10.0, status: 1 }
+  - { branch_i: 30, f_bus: 30, t_bus: 31, r: 0.0702, x: 0.0232, rateA: 10.0, status: 1 }
+  - { branch_i: 31, f_bus: 31, t_bus: 32, r: 0.351,  x: 0.116,  rateA: 10.0, status: 1 }
+  - { branch_i: 32, f_bus: 32, t_bus: 33, r: 0.839,  x: 0.2816, rateA: 10.0, status: 1 }
+  - { branch_i: 33, f_bus: 33, t_bus: 34, r: 1.708,  x: 0.5646, rateA: 10.0, status: 1 }
+  - { branch_i: 34, f_bus: 34, t_bus: 35, r: 1.474,  x: 0.4873, rateA: 10.0, status: 1 }
+  - { branch_i: 35, f_bus: 3,  t_bus: 36, r: 0.0044, x: 0.0108, rateA: 10.0, status: 1 }
+  - { branch_i: 36, f_bus: 36, t_bus: 37, r: 0.064,  x: 0.1565, rateA: 10.0, status: 1 }
+  - { branch_i: 37, f_bus: 37, t_bus: 38, r: 0.1053, x: 0.123,  rateA: 10.0, status: 1 }
+  - { branch_i: 38, f_bus: 38, t_bus: 39, r: 0.0304, x: 0.0355, rateA: 10.0, status: 1 }
+  - { branch_i: 39, f_bus: 39, t_bus: 40, r: 0.0018, x: 0.0021, rateA: 10.0, status: 1 }
+  - { branch_i: 40, f_bus: 40, t_bus: 41, r: 0.7283, x: 0.8509, rateA: 10.0, status: 1 }
+  - { branch_i: 41, f_bus: 41, t_bus: 42, r: 0.31,   x: 0.3623, rateA: 10.0, status: 1 }
+  - { branch_i: 42, f_bus: 42, t_bus: 43, r: 0.041,  x: 0.0478, rateA: 10.0, status: 1 }
+  - { branch_i: 43, f_bus: 43, t_bus: 44, r: 0.0092, x: 0.0116, rateA: 10.0, status: 1 }
+  - { branch_i: 44, f_bus: 44, t_bus: 45, r: 0.1089, x: 0.1373, rateA: 10.0, status: 1 }
+  - { branch_i: 45, f_bus: 45, t_bus: 46, r: 0.0009, x: 0.0012, rateA: 10.0, status: 1 }
+  - { branch_i: 46, f_bus: 4,  t_bus: 47, r: 0.0034, x: 0.0084, rateA: 10.0, status: 1 }
+  - { branch_i: 47, f_bus: 47, t_bus: 48, r: 0.0851, x: 0.2083, rateA: 10.0, status: 1 }
+  - { branch_i: 48, f_bus: 48, t_bus: 49, r: 0.2898, x: 0.7091, rateA: 10.0, status: 1 }
+  - { branch_i: 49, f_bus: 49, t_bus: 50, r: 0.0822, x: 0.2011, rateA: 10.0, status: 1 }
+  - { branch_i: 50, f_bus: 8,  t_bus: 51, r: 0.0928, x: 0.0473, rateA: 10.0, status: 1 }
+  - { branch_i: 51, f_bus: 51, t_bus: 52, r: 0.3319, x: 0.114,  rateA: 10.0, status: 1 }
+  - { branch_i: 52, f_bus: 9,  t_bus: 53, r: 0.174,  x: 0.0886, rateA: 10.0, status: 1 }
+  - { branch_i: 53, f_bus: 53, t_bus: 54, r: 0.203,  x: 0.1034, rateA: 10.0, status: 1 }
+  - { branch_i: 54, f_bus: 54, t_bus: 55, r: 0.2842, x: 0.1447, rateA: 10.0, status: 1 }
+  - { branch_i: 55, f_bus: 55, t_bus: 56, r: 0.2813, x: 0.1433, rateA: 10.0, status: 1 }
+  - { branch_i: 56, f_bus: 56, t_bus: 57, r: 1.59,   x: 0.5337, rateA: 10.0, status: 1 }
+  - { branch_i: 57, f_bus: 57, t_bus: 58, r: 0.7837, x: 0.263,  rateA: 10.0, status: 1 }
+  - { branch_i: 58, f_bus: 58, t_bus: 59, r: 0.3042, x: 0.1006, rateA: 10.0, status: 1 }
+  - { branch_i: 59, f_bus: 59, t_bus: 60, r: 0.3861, x: 0.1172, rateA: 10.0, status: 1 }
+  - { branch_i: 60, f_bus: 60, t_bus: 61, r: 0.5075, x: 0.2585, rateA: 10.0, status: 1 }
+  - { branch_i: 61, f_bus: 61, t_bus: 62, r: 0.0974, x: 0.0496, rateA: 10.0, status: 1 }
+  - { branch_i: 62, f_bus: 62, t_bus: 63, r: 0.145,  x: 0.0738, rateA: 10.0, status: 1 }
+  - { branch_i: 63, f_bus: 63, t_bus: 64, r: 0.7105, x: 0.3619, rateA: 10.0, status: 1 }
+  - { branch_i: 64, f_bus: 64, t_bus: 65, r: 1.041,  x: 0.5302, rateA: 10.0, status: 1 }
+  - { branch_i: 65, f_bus: 11, t_bus: 66, r: 0.2012, x: 0.0611, rateA: 10.0, status: 1 }
+  - { branch_i: 66, f_bus: 66, t_bus: 67, r: 0.0047, x: 0.0014, rateA: 10.0, status: 1 }
+  - { branch_i: 67, f_bus: 12, t_bus: 68, r: 0.7394, x: 0.2444, rateA: 10.0, status: 1 }
+  - { branch_i: 68, f_bus: 68, t_bus: 69, r: 0.0047, x: 0.0016, rateA: 10.0, status: 1 }

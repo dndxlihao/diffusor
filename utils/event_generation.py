@@ -114,6 +114,32 @@ def choose_station(ev_type: str, stations_type: Dict[str, List[Station]]) -> int
         raise RuntimeError(f"No station candidates for {t}")
     return int(random.choice(candidates).station_i)
 
+
+def _sample_event_window(ev_type: str, day: int) -> Tuple[int, int]:
+    if ev_type == "V2G":
+        return sample_residential(day)
+    if ev_type == "BUS":
+        return sample_depot(day)
+    if ev_type == "CAR":
+        return sample_highway(day)
+    return sample_highway(day)
+
+
+def _nonoverlap_schedule(
+    sampled: List[Tuple[int, int, int]],
+    *,
+    next_free_t: int,
+) -> List[Tuple[int, int, int]]:
+    scheduled: List[Tuple[int, int, int]] = []
+    cursor_t = int(next_free_t)
+    for arrival_t, departure_t, station_i in sorted(sampled, key=lambda x: (int(x[0]), int(x[1]), int(x[2]))):
+        dur_s = max(0, int(departure_t) - int(arrival_t))
+        start_t = max(int(arrival_t), int(cursor_t))
+        end_t = int(start_t) + int(dur_s)
+        scheduled.append((int(start_t), int(end_t), int(station_i)))
+        cursor_t = int(end_t)
+    return scheduled
+
 def generate_events(
     *,
     days: int,
@@ -127,6 +153,7 @@ def generate_events(
 
     events: List[ChargingEvent] = []
     eid = int(start_id)
+    ev_next_free_t: Dict[int, int] = {}
 
     for day in range(int(days)):
         for t, ev_list in ev_by_type.items():
@@ -142,19 +169,17 @@ def generate_events(
                     if random.random() < (rate - n):
                         n += 1
 
+                ev_type = str(getattr(ev, "type", "V2G")).upper()
+                sampled_windows: List[Tuple[int, int, int]] = []
                 for _ in range(int(n)):
-                    ev_type = str(getattr(ev, "type", "V2G")).upper()
+                    arrival_t, departure_t = _sample_event_window(ev_type, day)
                     station_i = choose_station(ev_type, station_by_type)
+                    sampled_windows.append((int(arrival_t), int(departure_t), int(station_i)))
 
-                    if ev_type == "V2G":
-                        arrival_t, departure_t = sample_residential(day)
-                    elif ev_type == "BUS":
-                        arrival_t, departure_t = sample_depot(day)
-                    elif ev_type == "CAR":
-                        arrival_t, departure_t = sample_highway(day)
-                    else:
-                        arrival_t, departure_t = sample_highway(day)
+                next_free_t = int(ev_next_free_t.get(int(ev.ev_i), 0))
+                scheduled_windows = _nonoverlap_schedule(sampled_windows, next_free_t=next_free_t)
 
+                for arrival_t, departure_t, station_i in scheduled_windows:
                     events.append(
                         ChargingEvent(
                             event_i=int(eid),
@@ -165,6 +190,7 @@ def generate_events(
                         )
                     )
                     eid += 1
+                    ev_next_free_t[int(ev.ev_i)] = int(departure_t)
 
     events.sort(key=lambda e: (int(e.arrival_t), int(e.event_i)))
     return events

@@ -1,0 +1,5 @@
+scenario_base: S0
+scenario: S0_0
+seed: 104
+lookahead_hours: 12
+rolling_interval_minutes: 360

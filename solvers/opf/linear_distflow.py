@@ -1,7 +1,8 @@
+from __future__ import annotations
 import yaml
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from pyomo.environ import * 
+from pyomo.environ import *
 from utils import get_series_value
 from DERs.ev import EV
 
@@ -14,13 +15,16 @@ class LinDistFlowConfig:
     time_yaml_path: str = "config/time.yaml"
     ev_yaml_path: str = "config/ev.yaml"
     queue_yaml_path: str = "config/event.yaml"
-    storage_end_soc: float = 0.5
-    storage_end_penalty: float = 200.0
+    storage_terminal_value_coeff: float = 1.0
     ev_resolution_seconds: int = 300
     v_penalty: float = 10000
     ev_depart_penalty: float = 20
     v2g_reward_coeff: float = 5.0
     ev_target_soc: float = 0.9
+    time_offset_seconds: int = 0
+    horizon_steps_override: Optional[int] = None
+    events_override: Optional[List[Dict[str, Any]]] = None
+    storage_soc0_override: Optional[Dict[int, float]] = None
     solver_options: Optional[Dict[str, Any]] = None
 
 def _value(x: Any, default: float = 0.0) -> float:
@@ -36,9 +40,10 @@ def time_steps(horizon_hours: int, resolution_minutes: int) -> Tuple[int, float]
 
 def build_price_series(cfg: LinDistFlowConfig, T: int, delta_t: float) -> List[float]:
     step_s = int(float(delta_t) * 3600.0)
+    offset_s = int(getattr(cfg, "time_offset_seconds", 0))
     prices: List[float] = []
     for tt in range(int(T)):
-        t_sec = tt * step_s
+        t_sec = offset_s + tt * step_s
         p = get_series_value(cfg.time_yaml_path, "price", t=t_sec)
         prices.append(float(p))
     return prices
@@ -86,6 +91,46 @@ def _v2g_priority(ev_obj: EV, soc: float, remain_s: int) -> float:
     return type_weight * base
 
 
+def _weighted_power_split(candidates: List[Tuple[float, int, float]], target_kw: float) -> Dict[int, float]:
+    alloc: Dict[int, float] = {}
+    remaining = max(0.0, float(target_kw))
+    if remaining <= 1e-9 or not candidates:
+        return alloc
+
+    caps: Dict[int, float] = {}
+    weights: Dict[int, float] = {}
+    active: List[int] = []
+    for score, item_id, cap in candidates:
+        cap_f = max(0.0, float(cap))
+        if cap_f <= 1e-9:
+            continue
+        caps[int(item_id)] = cap_f
+        weights[int(item_id)] = max(1e-6, float(score))
+        active.append(int(item_id))
+
+    while remaining > 1e-9 and active:
+        weight_sum = sum(weights[item_id] for item_id in active)
+        if weight_sum <= 1e-12:
+            break
+        next_active: List[int] = []
+        delivered = 0.0
+        for item_id in active:
+            share = remaining * (weights[item_id] / weight_sum)
+            give = min(caps[item_id], share)
+            if give > 1e-9:
+                alloc[item_id] = alloc.get(item_id, 0.0) + float(give)
+                caps[item_id] -= float(give)
+                delivered += float(give)
+            if caps[item_id] > 1e-9:
+                next_active.append(item_id)
+        if delivered <= 1e-9:
+            break
+        remaining -= delivered
+        active = next_active
+
+    return alloc
+
+
 def allocate_station_power(
     *,
     station_power_kw: Dict[Tuple[int, int], Dict[str, float]],
@@ -103,6 +148,7 @@ def allocate_station_power(
     power_ch: Dict[Tuple[int, int], float] = {}
     power_dis: Dict[Tuple[int, int], float] = {}
     unmet_departure_kwh: Dict[int, float] = {}
+    target_soc_eff = min(1.0, float(target_soc))
 
     for ev in events:
         eid = int(ev["event_i"])
@@ -134,27 +180,75 @@ def allocate_station_power(
             pch_target = float(station_power_kw.get((int(sid), int(k)), {}).get("pch", 0.0))
             pdis_target = float(station_power_kw.get((int(sid), int(k)), {}).get("pdis", 0.0))
             active = [eid for eid in eids if eid in state and int(state[eid]["start"]) < t1 and int(state[eid]["dep"]) > t0]
+            price_k = float(ev_slot_price.get(int(k), 0.0))
 
-            if pch_target > 1e-9 and active:
-                ranked: List[Tuple[float, int, float]] = []
+            charge_info: Dict[int, Tuple[float, float]] = {}
+            discharge_info: Dict[int, Tuple[float, float]] = {}
+            charge_pool: List[int] = []
+            discharge_pool: List[int] = []
+            dual_pool: List[Tuple[float, float, int]] = []
+
+            if active and (pch_target > 1e-9 or pdis_target > 1e-9):
                 for eid in active:
                     ev = event_by_id[eid]
                     ev_obj = ev_by_id.get(int(ev["ev_i"]))
                     if ev_obj is None:
                         continue
                     soc = float(state[eid]["soc"])
-                    ev_obj.soc = soc
-                    pmax = max(0.0, min(float(ev_obj.p_ch), float(ev_obj.charge_limit())))
-                    if pmax <= 1e-9 or soc >= min(1.0, float(target_soc)):
-                        continue
+                    cap = float(state[eid]["cap"])
                     remain_s = max(0, int(state[eid]["dep"]) - t0)
-                    score = _event_priority(ev_obj, soc, int(state[eid]["wait"]), remain_s)
-                    ranked.append((score, eid, pmax))
-                ranked.sort(key=lambda x: (-x[0], x[1]))
-                rem = float(pch_target)
-                for _, eid, pmax in ranked:
-                    if rem <= 1e-9:
-                        break
+                    ev_obj.soc = soc
+
+                    if pch_target > 1e-9:
+                        pmax_ch = max(0.0, min(float(ev_obj.p_ch), float(ev_obj.charge_limit())))
+                        if pmax_ch > 1e-9 and soc < target_soc_eff - 1e-9:
+                            ch_score = _event_priority(ev_obj, soc, int(state[eid]["wait"]), remain_s)
+                            eta_ch = max(1e-6, float(ev_obj.charge_efficiency(pmax_ch)))
+                            soc_room_kwh = max(0.0, (target_soc_eff - soc) * cap)
+                            p_soc_ch = soc_room_kwh / max(1e-9, eta_ch * dt_h)
+                            charge_info[eid] = (ch_score, min(pmax_ch, p_soc_ch))
+
+                    if pdis_target > 1e-9 and ev_obj.is_v2g(sell_price=price_k):
+                        pmax_dis = max(0.0, float(ev_obj.p_dis))
+                        if pmax_dis > 1e-9:
+                            target_surplus = max(0.0, soc - target_soc_eff)
+                            dis_score = _v2g_priority(ev_obj, soc, remain_s) + 10.0 * target_surplus
+                            energy_margin = max(0.0, (soc - float(ev_obj.v2g_minsoc())) * cap)
+                            p_soc_dis = energy_margin * float(ev_obj.eta_dis) / max(1e-9, dt_h)
+                            pdis_cap = min(pmax_dis, p_soc_dis)
+                            if pdis_cap > 1e-9:
+                                discharge_info[eid] = (dis_score, pdis_cap)
+
+                    has_charge = eid in charge_info
+                    has_discharge = eid in discharge_info
+                    if has_charge and not has_discharge:
+                        charge_pool.append(eid)
+                    elif has_discharge and not has_charge:
+                        discharge_pool.append(eid)
+                    elif has_charge and has_discharge:
+                        dual_pool.append((soc - target_soc_eff, discharge_info[eid][0] - charge_info[eid][0], eid))
+
+                if pch_target <= 1e-9:
+                    discharge_pool.extend(eid for _, _, eid in dual_pool)
+                elif pdis_target <= 1e-9:
+                    charge_pool.extend(eid for _, _, eid in dual_pool)
+                else:
+                    dual_pool.sort(reverse=True)
+                    discharge_cap = sum(discharge_info[eid][1] for eid in discharge_pool)
+                    for _, _, eid in dual_pool:
+                        if discharge_cap + 1e-9 < pdis_target:
+                            discharge_pool.append(eid)
+                            discharge_cap += discharge_info[eid][1]
+                        else:
+                            charge_pool.append(eid)
+
+            if pch_target > 1e-9 and charge_pool:
+                weighted_ch: List[Tuple[float, int, float]] = []
+                for eid in charge_pool:
+                    score, cap_kw = charge_info[eid]
+                    weighted_ch.append((score, eid, cap_kw))
+                charge_alloc = _weighted_power_split(weighted_ch, pch_target)
+                for eid, p in charge_alloc.items():
                     ev = event_by_id[eid]
                     ev_obj = ev_by_id.get(int(ev["ev_i"]))
                     if ev_obj is None:
@@ -162,41 +256,19 @@ def allocate_station_power(
                     soc = float(state[eid]["soc"])
                     cap = float(state[eid]["cap"])
                     ev_obj.soc = soc
-                    eta = max(1e-6, float(ev_obj.charge_efficiency(min(rem, pmax))))
-                    soc_room_kwh = max(0.0, (min(1.0, float(target_soc)) - soc) * cap)
-                    if soc_room_kwh <= 1e-9:
-                        continue
-                    p_soc = soc_room_kwh / max(1e-9, eta * dt_h)
-                    p = min(rem, pmax, p_soc)
+                    eta = max(1e-6, float(ev_obj.charge_efficiency(p)))
                     if p <= 1e-9:
                         continue
                     power_ch[(eid, k)] = float(p)
                     state[eid]["soc"] = min(1.0, soc + (p * eta * dt_h) / cap)
-                    rem -= p
 
-            if pdis_target > 1e-9 and active:
-                ranked_dis: List[Tuple[float, int, float]] = []
-                price_k = float(ev_slot_price.get(int(k), 0.0))
-                for eid in active:
-                    ev = event_by_id[eid]
-                    ev_obj = ev_by_id.get(int(ev["ev_i"]))
-                    if ev_obj is None:
-                        continue
-                    soc = float(state[eid]["soc"])
-                    ev_obj.soc = soc
-                    if not ev_obj.is_v2g(sell_price=price_k):
-                        continue
-                    pmax = max(0.0, float(ev_obj.p_dis))
-                    if pmax <= 1e-9:
-                        continue
-                    remain_s = max(0, int(state[eid]["dep"]) - t0)
-                    score = _v2g_priority(ev_obj, soc, remain_s)
-                    ranked_dis.append((score, eid, pmax))
-                ranked_dis.sort(key=lambda x: (-x[0], x[1]))
-                rem = float(pdis_target)
-                for _, eid, pmax in ranked_dis:
-                    if rem <= 1e-9:
-                        break
+            if pdis_target > 1e-9 and discharge_pool:
+                weighted_dis: List[Tuple[float, int, float]] = []
+                for eid in discharge_pool:
+                    score, cap_kw = discharge_info[eid]
+                    weighted_dis.append((score, eid, cap_kw))
+                discharge_alloc = _weighted_power_split(weighted_dis, pdis_target)
+                for eid, p in discharge_alloc.items():
                     ev = event_by_id[eid]
                     ev_obj = ev_by_id.get(int(ev["ev_i"]))
                     if ev_obj is None:
@@ -204,14 +276,10 @@ def allocate_station_power(
                     soc = float(state[eid]["soc"])
                     cap = float(state[eid]["cap"])
                     min_soc = float(ev_obj.v2g_minsoc())
-                    energy_margin = max(0.0, (soc - min_soc) * cap)
-                    p_soc = energy_margin * float(ev_obj.eta_dis) / max(1e-9, dt_h)
-                    p = min(rem, pmax, p_soc)
                     if p <= 1e-9:
                         continue
                     power_dis[(eid, k)] = float(p)
                     state[eid]["soc"] = max(min_soc, soc - (p / max(1e-6, float(ev_obj.eta_dis)) * dt_h) / cap)
-                    rem -= p
 
         for eid in eids:
             ev = event_by_id[eid]
@@ -245,7 +313,10 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     stos = [s for s in grid.storages if int(s.status) == 1]
     sto_ids = [int(s.storage_i) for s in stos]
     stations, events = load_queue_yaml(cfg.queue_yaml_path)
+    if cfg.events_override is not None:
+        events = [dict(ev) for ev in cfg.events_override]
     event_ids: List[int] = [int(ev["event_i"]) for ev in events]
+    time_offset_s = int(getattr(cfg, "time_offset_seconds", 0))
 
     # 1.1 grouping by bus
     gen_by_bus: Dict[int, List[int]] = {int(b): [] for b in bus_ids}
@@ -301,7 +372,7 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
         q_coeff[rid] = renewable_q_coeff(rr)
         curt_cost[rid] = float(rr.curt_cost)
         for tt in range(T):
-            t_sec = int(tt * delta_t * 3600.0)
+            t_sec = time_offset_s + int(tt * delta_t * 3600.0)
             pav_mw[(rid, tt)] = float(grid.renewable_pav_mw(rid, t=int(t_sec)))
 
     # 1.4 storages
@@ -316,26 +387,15 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     for sid in sto_ids:
         ss = sto_dict[sid]
         sto_Emax[sid] = float(ss.Emax)
-        sto_soc0[sid] = float(ss.soc)
+        if cfg.storage_soc0_override is not None and sid in cfg.storage_soc0_override:
+            sto_soc0[sid] = float(cfg.storage_soc0_override[sid])
+        else:
+            sto_soc0[sid] = float(ss.soc)
         sto_pch_max_mw[sid] = float(ss.P_ch) / 1000.0
         sto_pdis_max_mw[sid] = abs(float(ss.P_dis)) / 1000.0
         sto_eta_ch[sid] = float(ss.eta_ch)
         sto_eta_dis[sid] = float(ss.eta_dis)
         sto_qc[sid] = float(storage_q_coeff(ss))
-
-    # 1.4b SOPs
-    sops = [s for s in getattr(grid, "sops", []) if int(getattr(s, "status", 1)) == 1]
-    sop_ids = [int(getattr(s, "sop_i")) for s in sops]
-    sop_Pmax: Dict[int, float] = {}
-    sop_Smax: Dict[int, float] = {}
-    sop_Qcap: Dict[int, float] = {}
-    for sop in sops:
-        sid = int(getattr(sop, "sop_i"))
-        sop_Pmax[sid] = float(getattr(sop, "Pmax", 0.0)) / baseMVA
-        sop_Smax[sid] = float(getattr(sop, "Smax", 0.0)) / baseMVA
-        qmax = float(getattr(sop, "Qmax", 0.0))
-        qmin = float(getattr(sop, "Qmin", 0.0))
-        sop_Qcap[sid] = max(abs(qmax), abs(qmin)) / baseMVA
 
     # 1.5 EV station-aggregated params
     if not stations:
@@ -345,7 +405,7 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     station_bus = {sid: int(station_by_id[sid]["bus_i"]) for sid in station_by_id}
 
     ev_step_s = int(cfg.ev_resolution_seconds)
-    horizon_s = int(cfg.horizon_hours) * 3600
+    horizon_s = int(round(float(T) * float(delta_t) * 3600.0))
     K_ev = int(_ceil_div(horizon_s, ev_step_s))
 
     ev_by_id: Dict[int, EV] = load_evs(cfg.ev_yaml_path)
@@ -354,14 +414,14 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     st_pch_cap_kw: Dict[Tuple[int, int], float] = {}
     st_pdis_cap_kw: Dict[Tuple[int, int], float] = {}
     st_active_any: Dict[Tuple[int, int], int] = {}
-    st_req_kwh: Dict[int, float] = {sid: 0.0 for sid in station_ids}
     st_req_cum_kwh: Dict[Tuple[int, int], float] = {}
     st_due_flag: Dict[Tuple[int, int], int] = {}
-    st_eta_ch: Dict[int, float] = {sid: 0.95 for sid in station_ids}
-    st_eta_dis: Dict[int, float] = {sid: 0.90 for sid in station_ids}
-    eta_ch_sum: Dict[int, float] = {sid: 0.0 for sid in station_ids}
-    eta_dis_sum: Dict[int, float] = {sid: 0.0 for sid in station_ids}
-    eta_cnt: Dict[int, int] = {sid: 0 for sid in station_ids}
+    st_eta_ch_num: Dict[Tuple[int, int], float] = {}
+    st_eta_ch_den: Dict[Tuple[int, int], float] = {}
+    st_eta_dis_num: Dict[Tuple[int, int], float] = {}
+    st_eta_dis_den: Dict[Tuple[int, int], float] = {}
+    st_eta_ch_slot: Dict[Tuple[int, int], float] = {}
+    st_eta_dis_slot: Dict[Tuple[int, int], float] = {}
     ev_slot_price: Dict[int, float] = {
         k: float(get_series_value(cfg.time_yaml_path, "price", t=int(k * ev_step_s))) for k in range(int(K_ev))
     }
@@ -372,47 +432,55 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
         sid = int(e["station_i"])
         if sid not in station_by_id:
             continue
-        station_event_ids.setdefault(sid, []).append(eid)
         arr = int(e["arrival_t"])
         st = int(e.get("start_t", arr))
         dep = int(e["departure_t"])
+        if dep <= 0 or st >= horizon_s:
+            continue
+        station_event_ids.setdefault(sid, []).append(eid)
         st = min(horizon_s, max(0, st))
-        dep = min(horizon_s, max(st, dep))
+        dep_active = min(horizon_s, max(st, dep))
         ev_obj = ev_by_id.get(ev_i, None)
         if ev_obj is None:
             continue
         soc0 = float(e.get("soc_init", getattr(ev_obj, "soc", 0.5)))
-        dep_k = int(_ceil_div(dep, ev_step_s))
-        ev_obj.soc = soc0
-        req_kwh = max(0.0, (float(cfg.ev_target_soc) - soc0) * float(ev_obj.capacity))
-        st_req_kwh[sid] += req_kwh
-        st_req_cum_kwh[(sid, dep_k)] = float(st_req_cum_kwh.get((sid, dep_k), 0.0)) + req_kwh
-        st_due_flag[(sid, dep_k)] = 1
-        eta_ch_sum[sid] += float(ev_obj.eta_ch)
-        eta_dis_sum[sid] += float(ev_obj.eta_dis)
-        eta_cnt[sid] += 1
+        cap_kwh = float(ev_obj.capacity)
+        if dep <= horizon_s:
+            dep_k = int(_ceil_div(dep, ev_step_s))
+            req_kwh = max(0.0, (float(cfg.ev_target_soc) - soc0) * cap_kwh)
+            st_req_cum_kwh[(sid, dep_k)] = float(st_req_cum_kwh.get((sid, dep_k), 0.0)) + req_kwh
+            st_due_flag[(sid, dep_k)] = 1
         for k in range(int(K_ev)):
             t0 = int(k * ev_step_s)
             t1 = int(min(horizon_s, (k + 1) * ev_step_s))
-            dt = _sec_overlap(t0, t1, st, dep)
+            dt = _sec_overlap(t0, t1, st, dep_active)
             if dt <= 0:
                 continue
             st_active_any[(sid, k)] = 1
-            st_pch_cap_kw[(sid, k)] = float(st_pch_cap_kw.get((sid, k), 0.0)) + float(ev_obj.p_ch)
-            if ev_obj.is_v2g(sell_price=float(ev_slot_price.get(k, 0.0))):
-                st_pdis_cap_kw[(sid, k)] = float(st_pdis_cap_kw.get((sid, k), 0.0)) + float(ev_obj.p_dis)
+            pch_cap = max(0.0, float(ev_obj.p_ch))
+            pdis_cap = max(0.0, float(ev_obj.p_dis)) if ev_obj.is_v2g(sell_price=float(ev_slot_price.get(k, 0.0))) else 0.0
+            st_pch_cap_kw[(sid, k)] = float(st_pch_cap_kw.get((sid, k), 0.0)) + pch_cap
+            st_pdis_cap_kw[(sid, k)] = float(st_pdis_cap_kw.get((sid, k), 0.0)) + pdis_cap
+            if pch_cap > 1e-9:
+                st_eta_ch_num[(sid, k)] = float(st_eta_ch_num.get((sid, k), 0.0)) + pch_cap * max(1e-6, float(ev_obj.eta_ch))
+                st_eta_ch_den[(sid, k)] = float(st_eta_ch_den.get((sid, k), 0.0)) + pch_cap
+            if pdis_cap > 1e-9:
+                st_eta_dis_num[(sid, k)] = float(st_eta_dis_num.get((sid, k), 0.0)) + pdis_cap * max(1e-6, float(ev_obj.eta_dis))
+                st_eta_dis_den[(sid, k)] = float(st_eta_dis_den.get((sid, k), 0.0)) + pdis_cap
     for sid in station_ids:
-        if eta_cnt[sid] > 0:
-            st_eta_ch[sid] = eta_ch_sum[sid] / float(eta_cnt[sid])
-            st_eta_dis[sid] = eta_dis_sum[sid] / float(eta_cnt[sid])
         cum = 0.0
         for k in range(int(K_ev) + 1):
             cum += float(st_req_cum_kwh.get((sid, k), 0.0))
             st_req_cum_kwh[(sid, k)] = cum
+        for k in range(int(K_ev)):
+            ch_den = float(st_eta_ch_den.get((sid, k), 0.0))
+            dis_den = float(st_eta_dis_den.get((sid, k), 0.0))
+            st_eta_ch_slot[(sid, k)] = float(st_eta_ch_num.get((sid, k), 0.0)) / ch_den if ch_den > 1e-9 else 0.95
+            st_eta_dis_slot[(sid, k)] = float(st_eta_dis_num.get((sid, k), 0.0)) / dis_den if dis_den > 1e-9 else 0.90
 
     # Overlap weights EV slots -> OPF steps (per station bus)
     opf_step_s = int(round(float(delta_t) * 3600.0))
-    st_w: Dict[Tuple[int, int, int, int], float] = {}  # {(bus, tt, sid, k): weight}
+    st_w: Dict[Tuple[int, int, int, int], float] = {}
     for tt in range(int(T)):
         a0 = int(tt * opf_step_s)
         a1 = int(min(horizon_s, (tt + 1) * opf_step_s))
@@ -442,13 +510,13 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     m.REN = Set(initialize=ren_ids)
     m.STO = Set(initialize=sto_ids)  
     m.STN = Set(initialize=station_ids)
-    m.SOP = Set(initialize=sop_ids)
     m.EDGE = Set(dimen=2, initialize=edge_set) 
 
     # Params
     m.price = Param(m.T, initialize={t: float(prices[t]) for t in range(int(T))}, mutable=False)  
     m.br_id = Param(m.EDGE, initialize={e: int(edge_to_branch[e]) for e in edge_set}, mutable=False) 
     m.ev_price = Param(m.KEV, initialize={k: float(ev_slot_price.get(int(k), 0.0)) for k in range(int(K_ev))}, mutable=False) 
+    terminal_price = float(prices[int(T) - 1]) if int(T) > 0 else 0.0
 
     # Renewables params
     m.Pav = Param(
@@ -468,32 +536,37 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     m.eta_ch = Param(m.STO, initialize={sid: float(sto_eta_ch[int(sid)]) for sid in sto_ids}, mutable=False) 
     m.eta_dis = Param(m.STO, initialize={sid: float(sto_eta_dis[int(sid)]) for sid in sto_ids}, mutable=False) 
     m.qc_sto = Param(m.STO, initialize={sid: float(sto_qc[int(sid)]) for sid in sto_ids}, mutable=False) 
-    m.sop_Pmax = Param(m.SOP, initialize={sid: float(sop_Pmax[int(sid)]) for sid in sop_ids}, mutable=False)
-    m.sop_Smax = Param(m.SOP, initialize={sid: float(sop_Smax[int(sid)]) for sid in sop_ids}, mutable=False)
-    m.sop_Qcap = Param(m.SOP, initialize={sid: float(sop_Qcap[int(sid)]) for sid in sop_ids}, mutable=False)
-
     # Station-aggregated EV params
     m.st_active = Param(
         m.STN,
         m.KEV,
-        initialize={(sid, k): int(st_active_any.get((int(sid), int(k)), 0)) for sid in station_ids for k in range(K_ev)},
+        initialize={(sid, k): int(st_active_any.get((int(sid), int(k)), 0)) for sid in station_ids for k in range(int(K_ev))},
         mutable=False,
     )
     m.st_pch_cap = Param(
         m.STN,
         m.KEV,
-        initialize={(sid, k): float(st_pch_cap_kw.get((int(sid), int(k)), 0.0)) for sid in station_ids for k in range(K_ev)},
+        initialize={(sid, k): float(st_pch_cap_kw.get((int(sid), int(k)), 0.0)) for sid in station_ids for k in range(int(K_ev))},
         mutable=False,
     )
     m.st_pdis_cap = Param(
         m.STN,
         m.KEV,
-        initialize={(sid, k): float(st_pdis_cap_kw.get((int(sid), int(k)), 0.0)) for sid in station_ids for k in range(K_ev)},
+        initialize={(sid, k): float(st_pdis_cap_kw.get((int(sid), int(k)), 0.0)) for sid in station_ids for k in range(int(K_ev))},
         mutable=False,
     )
-    m.st_eta_ch = Param(m.STN, initialize={sid: float(st_eta_ch[int(sid)]) for sid in station_ids}, mutable=False)
-    m.st_eta_dis = Param(m.STN, initialize={sid: float(st_eta_dis[int(sid)]) for sid in station_ids}, mutable=False)
-    m.st_req_kwh = Param(m.STN, initialize={sid: float(st_req_kwh[int(sid)]) for sid in station_ids}, mutable=False)
+    m.st_eta_ch = Param(
+        m.STN,
+        m.KEV,
+        initialize={(sid, k): float(st_eta_ch_slot.get((int(sid), int(k)), 0.95)) for sid in station_ids for k in range(int(K_ev))},
+        mutable=False,
+    )
+    m.st_eta_dis = Param(
+        m.STN,
+        m.KEV,
+        initialize={(sid, k): float(st_eta_dis_slot.get((int(sid), int(k)), 0.90)) for sid in station_ids for k in range(int(K_ev))},
+        mutable=False,
+    )
     m.st_req_cum = Param(
         m.STN,
         m.KEV_SOC,
@@ -526,24 +599,14 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     m.u_sto_ch = Var(m.STO, m.T, domain=Binary) 
     m.u_sto_dis = Var(m.STO, m.T, domain=Binary) 
     m.soc = Var(m.STO, m.TSOC, domain=Reals) 
-    m.soc_end_short = Var(m.STO, domain=NonNegativeReals)
 
     # Station-aggregated EV variables
     m.st_pch = Var(m.STN, m.KEV, domain=NonNegativeReals)
     m.st_pdis = Var(m.STN, m.KEV, domain=NonNegativeReals)
-    m.u_stn_ch = Var(m.STN, m.KEV, domain=Binary)
-    m.u_stn_dis = Var(m.STN, m.KEV, domain=Binary)
     m.st_energy = Var(m.STN, m.KEV_SOC, domain=NonNegativeReals)
     m.st_short = Var(m.STN, m.KEV_SOC, domain=NonNegativeReals)
-
-    # SOP transfers (pu) + direction
-    m.P_sop_ft = Var(m.SOP, m.T, domain=NonNegativeReals)  
-    m.P_sop_tf = Var(m.SOP, m.T, domain=NonNegativeReals) 
-    m.Q_sop_ft = Var(m.SOP, m.T, domain=Reals) 
-    m.Q_sop_tf = Var(m.SOP, m.T, domain=Reals) 
-    m.u_sop_ft = Var(m.SOP, m.T, domain=Binary)  
-    m.S_sop_ft = Var(m.SOP, m.T, domain=NonNegativeReals) 
-    m.S_sop_tf = Var(m.SOP, m.T, domain=NonNegativeReals) 
+    for sid in station_ids:
+        m.st_energy[sid, 0].fix(0.0)
 
     # Grid buy/sell
     m.P_buy = Var(m.T, domain=NonNegativeReals, bounds=(0.0, 100.0)) 
@@ -622,86 +685,38 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
 
     m.SocDyn = Constraint(m.STO, m.T, rule=soc_dyn) 
 
-    def soc_end_target(mm, sid):
-        return mm.soc[sid, T] + mm.soc_end_short[sid] >= float(cfg.storage_end_soc)
-
-    m.SocEndTarget = Constraint(m.STO, rule=soc_end_target) 
-
     # Station-aggregated EV constraints
-    def st_energy_lb(mm, sid, k):
-        return mm.st_energy[sid, k] >= 0.0
-
-    m.STEnergyLB = Constraint(m.STN, m.KEV_SOC, rule=st_energy_lb)
-    for sid in station_ids:
-        m.st_energy[sid, 0].fix(0.0)
-
     def st_pch_bound(mm, sid, k):
-        return mm.st_pch[sid, k] <= mm.st_pch_cap[sid, k] * mm.u_stn_ch[sid, k]
+        return mm.st_pch[sid, k] <= mm.st_pch_cap[sid, k]
 
     def st_pdis_bound(mm, sid, k):
-        return mm.st_pdis[sid, k] <= mm.st_pdis_cap[sid, k] * mm.u_stn_dis[sid, k]
+        return mm.st_pdis[sid, k] <= mm.st_pdis_cap[sid, k]
 
-    def st_no_simul(mm, sid, k):
-        return mm.u_stn_ch[sid, k] + mm.u_stn_dis[sid, k] <= mm.st_active[sid, k]
-
-    m.STPchBound = Constraint(m.STN, m.KEV, rule=st_pch_bound)
-    m.STPdisBound = Constraint(m.STN, m.KEV, rule=st_pdis_bound)
-    m.STNoSimul = Constraint(m.STN, m.KEV, rule=st_no_simul)
+    def st_shared_bound(mm, sid, k):
+        pch_cap = float(st_pch_cap_kw.get((int(sid), int(k)), 0.0))
+        pdis_cap = float(st_pdis_cap_kw.get((int(sid), int(k)), 0.0))
+        active = int(st_active_any.get((int(sid), int(k)), 0))
+        if active <= 0 or (pch_cap <= 1e-9 and pdis_cap <= 1e-9):
+            return mm.st_pch[sid, k] + mm.st_pdis[sid, k] == 0.0
+        if pch_cap <= 1e-9:
+            return mm.st_pdis[sid, k] <= pdis_cap
+        if pdis_cap <= 1e-9:
+            return mm.st_pch[sid, k] <= pch_cap
+        return (mm.st_pch[sid, k] / pch_cap) + (mm.st_pdis[sid, k] / pdis_cap) <= 1.0
 
     def st_energy_dyn(mm, sid, k):
         dt_h = float(ev_step_s) / 3600.0
-        dE = (mm.st_pch[sid, k] * mm.st_eta_ch[sid] - (mm.st_pdis[sid, k] / mm.st_eta_dis[sid])) * dt_h
+        dE = (mm.st_pch[sid, k] * mm.st_eta_ch[sid, k] - (mm.st_pdis[sid, k] / mm.st_eta_dis[sid, k])) * dt_h
         return mm.st_energy[sid, k + 1] == mm.st_energy[sid, k] + dE
-
-    m.STEnergyDyn = Constraint(m.STN, m.KEV, rule=st_energy_dyn)
 
     def st_shortfall(mm, sid, k):
         return mm.st_short[sid, k] >= mm.st_req_cum[sid, k] - mm.st_energy[sid, k]
 
+    m.STPchBound = Constraint(m.STN, m.KEV, rule=st_pch_bound)
+    m.STPdisBound = Constraint(m.STN, m.KEV, rule=st_pdis_bound)
+    m.STSharedBound = Constraint(m.STN, m.KEV, rule=st_shared_bound)
+    m.STEnergyDyn = Constraint(m.STN, m.KEV, rule=st_energy_dyn)
     m.STShortfall = Constraint(m.STN, m.KEV_SOC, rule=st_shortfall)
-
-    # SOP constraints
-    def sop_p_ft_bound(mm, sid, tt):
-        return mm.P_sop_ft[sid, tt] <= mm.sop_Pmax[sid] * mm.u_sop_ft[sid, tt]
-
-    def sop_p_tf_bound(mm, sid, tt):
-        return mm.P_sop_tf[sid, tt] <= mm.sop_Pmax[sid] * (1 - mm.u_sop_ft[sid, tt])
-
-    def sop_q_ft_ub(mm, sid, tt):
-        return mm.Q_sop_ft[sid, tt] <= mm.sop_Qcap[sid] * mm.u_sop_ft[sid, tt]
-
-    def sop_q_ft_lb(mm, sid, tt):
-        return mm.Q_sop_ft[sid, tt] >= -mm.sop_Qcap[sid] * mm.u_sop_ft[sid, tt]
-
-    def sop_q_tf_ub(mm, sid, tt):
-        return mm.Q_sop_tf[sid, tt] <= mm.sop_Qcap[sid] * (1 - mm.u_sop_ft[sid, tt])
-
-    def sop_q_tf_lb(mm, sid, tt):
-        return mm.Q_sop_tf[sid, tt] >= -mm.sop_Qcap[sid] * (1 - mm.u_sop_ft[sid, tt])
-
-    m.SopPftBound = Constraint(m.SOP, m.T, rule=sop_p_ft_bound) 
-    m.SopPtfBound = Constraint(m.SOP, m.T, rule=sop_p_tf_bound) 
-    m.SopQftUB = Constraint(m.SOP, m.T, rule=sop_q_ft_ub) 
-    m.SopQftLB = Constraint(m.SOP, m.T, rule=sop_q_ft_lb) 
-    m.SopQtfUB = Constraint(m.SOP, m.T, rule=sop_q_tf_ub) 
-    m.SopQtfLB = Constraint(m.SOP, m.T, rule=sop_q_tf_lb) 
-
-    def sop_S_ft_cone(mm, sid, tt):
-        return mm.S_sop_ft[sid, tt] ** 2 >= mm.P_sop_ft[sid, tt] ** 2 + mm.Q_sop_ft[sid, tt] ** 2
-
-    def sop_S_tf_cone(mm, sid, tt):
-        return mm.S_sop_tf[sid, tt] ** 2 >= mm.P_sop_tf[sid, tt] ** 2 + mm.Q_sop_tf[sid, tt] ** 2
-
-    def sop_S_ft_gate(mm, sid, tt):
-        return mm.S_sop_ft[sid, tt] <= mm.sop_Smax[sid] * mm.u_sop_ft[sid, tt]
-
-    def sop_S_tf_gate(mm, sid, tt):
-        return mm.S_sop_tf[sid, tt] <= mm.sop_Smax[sid] * (1 - mm.u_sop_ft[sid, tt])
-
-    m.SopSftCone = Constraint(m.SOP, m.T, rule=sop_S_ft_cone) 
-    m.SopStfCone = Constraint(m.SOP, m.T, rule=sop_S_tf_cone)  
-    m.SopSftGate = Constraint(m.SOP, m.T, rule=sop_S_ft_gate) 
-    m.SopStfGate = Constraint(m.SOP, m.T, rule=sop_S_tf_gate) 
 
     # Branch constraints
     def branch_soc(mm, i, j, tt):
@@ -759,7 +774,7 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     # Nodal balances
     def p_balance(mm, i, tt):
         i_int = int(i)
-        t_sec = int(tt * delta_t * 3600.0)
+        t_sec = time_offset_s + int(tt * delta_t * 3600.0)
         bus = grid.get_bus(i_int)
         Pd, _ = grid.bus_PQ_pu(bus, t=t_sec)
         incoming = 0.0 if i_int == slack else mm.P[(int(parent[i_int]), i_int), tt]
@@ -769,7 +784,7 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
 
     def q_balance(mm, i, tt):
         i_int = int(i)
-        t_sec = int(tt * delta_t * 3600.0)
+        t_sec = time_offset_s + int(tt * delta_t * 3600.0)
         bus = grid.get_bus(i_int)
         _, Qd = grid.bus_PQ_pu(bus, t=t_sec)
         incoming = 0.0 if i_int == slack else mm.Q[(int(parent[i_int]), i_int), tt]
@@ -783,7 +798,7 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
     # Objective
     ev_pen = float(cfg.ev_depart_penalty)
     v2g_rw = float(cfg.v2g_reward_coeff)
-    sto_end_pen = float(cfg.storage_end_penalty)
+    sto_terminal_value_coeff = float(cfg.storage_terminal_value_coeff)
 
     def obj(mm):
         total = 0.0
@@ -806,8 +821,10 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
             if cfg.v_penalty:
                 for i in bus_ids:
                     total += float(cfg.v_penalty) * (mm.Vu[i, tt] + mm.Vl[i, tt])
-        for sid in sto_ids:
-            total += sto_end_pen * mm.soc_end_short[sid]
+        if sto_terminal_value_coeff != 0.0 and int(T) > 0:
+            for sid in sto_ids:
+                terminal_energy_mwh = mm.Emax[sid] * mm.soc[sid, T]
+                total -= sto_terminal_value_coeff * terminal_price * terminal_energy_mwh * 1000.0
 
         # Station-level EV shortfall and V2G reward
         for sid in station_ids:
@@ -815,10 +832,10 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
                 if int(st_due_flag.get((int(sid), int(k)), 0)) == 0:
                     continue
                 total += ev_pen * mm.st_short[sid, k]
-        if v2g_rw != 0.0 and station_ids:
+        if v2g_rw != 0.0:
+            dt_h = float(ev_step_s) / 3600.0
             for sid in station_ids:
                 for k in range(int(K_ev)):
-                    dt_h = float(ev_step_s) / 3600.0
                     price_k = value(mm.ev_price[k])
                     e_kwh = mm.st_pdis[sid, k] * dt_h
                     total -= v2g_rw * price_k * e_kwh
@@ -837,7 +854,6 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
         "gen_ids": list(gen_ids),
         "ren_ids": list(ren_ids),
         "sto_ids": list(sto_ids),
-        "event_ids": list(event_ids),
         "station_ids": list(station_ids),
         "K_ev": int(K_ev),
         "ev_step_s": int(ev_step_s),
@@ -849,8 +865,8 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
         "ev_depart_penalty": float(cfg.ev_depart_penalty),
         "v2g_reward_coeff": float(cfg.v2g_reward_coeff),
         "ev_target_soc": float(cfg.ev_target_soc),
-        "storage_end_soc": float(cfg.storage_end_soc),
-        "storage_end_penalty": float(cfg.storage_end_penalty),
+        "storage_terminal_value_coeff": float(cfg.storage_terminal_value_coeff),
+        "storage_terminal_price": float(terminal_price),
         "time_yaml_path": str(cfg.time_yaml_path),
         "queue_yaml_path": str(cfg.queue_yaml_path),
     }
@@ -858,11 +874,15 @@ def build_model(grid: Any, cfg: LinDistFlowConfig, T: int, delta_t: float, price
 
 # Solve
 def solve_opf(grid: Any, cfg: LinDistFlowConfig):
-    T, delta_t = time_steps(cfg.horizon_hours, cfg.resolution_minutes)
+    delta_t = float(cfg.resolution_minutes) / 60.0
+    if cfg.horizon_steps_override is not None:
+        T = int(cfg.horizon_steps_override)
+    else:
+        T = int(cfg.horizon_hours / delta_t)
     prices = build_price_series(cfg, T, delta_t)
 
     print("\n========== LinDistFlow OPF Time Configuration ==========")
-    print(f"Horizon: {cfg.horizon_hours} hours")
+    print(f"Horizon: {T * delta_t:.2f} hours")
     print(f"Resolution: {cfg.resolution_minutes} minutes")
     print(f"Delta t: {delta_t:.2f} hours")
     print(f"Time steps (T): {T}")
@@ -873,7 +893,12 @@ def solve_opf(grid: Any, cfg: LinDistFlowConfig):
     if cfg.solver_options:
         for k, v in cfg.solver_options.items():
             solver.options[k] = v
-    results = solver.solve(model, tee=cfg.tee)
+    results = solver.solve(model, tee=cfg.tee, load_solutions=False)
+    if len(getattr(results, "solution", [])) > 0:
+        try:
+            model.solutions.load_from(results)
+        except Exception:
+            pass
 
     status = str(results.solver.status)
     term = str(results.solver.termination_condition)
@@ -891,11 +916,18 @@ def solve_opf(grid: Any, cfg: LinDistFlowConfig):
         "objective": None,
     }
 
+    has_primal_solution = False
+    try:
+        _obj_probe = value(model.Obj)
+        has_primal_solution = _obj_probe is not None
+    except Exception:
+        has_primal_solution = False
+
     if results.solver.termination_condition in (
         TerminationCondition.optimal, 
         TerminationCondition.locallyOptimal,  
         TerminationCondition.feasible, 
-    ):
+    ) or has_primal_solution:
         objv = round(value(model.Obj), 4) 
         report["objective"] = objv
         print("Objective:", objv)

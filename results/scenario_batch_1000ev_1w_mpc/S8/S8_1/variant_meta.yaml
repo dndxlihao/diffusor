@@ -1,0 +1,5 @@
+scenario_base: S8
+scenario: S8_1
+seed: 150
+lookahead_hours: 18
+rolling_interval_minutes: 360

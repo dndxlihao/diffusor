@@ -36,18 +36,18 @@ buses:
   - { bus_i: 33, type: PQ,    Pd: 420,  Qd: 280,  Vm: 1.0, Va: 0.0, baseKV: 12.66, Vmax: 1.1, Vmin: 0.9 }
 
 generators:
-  - { gen_i: 1,  bus_i: 2,  status: 1, Pmax: 4,  Pmin: 0, Qmax: 100, Qmin: -100, cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
-  - { gen_i: 2,  bus_i: 3,  status: 1, Pmax: 4,  Pmin: 0, Qmax: 100, Qmin: -100, cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
-  - { gen_i: 3,  bus_i: 6,  status: 1, Pmax: 3,  Pmin: 0, Qmax: 50,  Qmin: -50,  cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
+  - { gen_i: 1,  bus_i: 2,  status: 1, Pmax: 5,  Pmin: 0, Qmax: 150, Qmin: -150, cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
+  - { gen_i: 2,  bus_i: 3,  status: 1, Pmax: 5,  Pmin: 0, Qmax: 150, Qmin: -150, cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
+  - { gen_i: 3,  bus_i: 6,  status: 1, Pmax: 4,  Pmin: 0, Qmax: 80,  Qmin: -500, cost_c2: 10.0, cost_c1: 100.0, cost_c0: 2500.0 }
 
 renewables:
-  - { renewable_i: 1, bus_i: 4,  type: PV,   status: 1, Pmax: 1.0, pf: 0.95, pf_mode: lead, curt_cost: 100000.0 }
-  - { renewable_i: 2, bus_i: 7,  type: PV,   status: 1, Pmax: 1.5, pf: 0.95, pf_mode: lag,  curt_cost: 100000.0 }
-  - { renewable_i: 3, bus_i: 18, type: WIND, status: 1, Pmax: 1.5, pf: 0.95, pf_mode: lead, curt_cost: 100000.0 }
-  - { renewable_i: 4, bus_i: 33, type: WIND, status: 1, Pmax: 1.0, pf: 0.95, pf_mode: lag,  curt_cost: 100000.0 }
+  - { renewable_i: 1, bus_i: 4,  type: PV,   status: 1, Pmax: 1.0, pf: 0.95, pf_mode: lag,  curt_cost: 100000.0 }
+  - { renewable_i: 2, bus_i: 7,  type: PV,   status: 1, Pmax: 1.5, pf: 0.80, pf_mode: lead, curt_cost: 100000.0 }
+  - { renewable_i: 3, bus_i: 18, type: WIND, status: 1, Pmax: 1.5, pf: 0.80, pf_mode: lag,  curt_cost: 100000.0 }
+  - { renewable_i: 4, bus_i: 33, type: WIND, status: 1, Pmax: 1.0, pf: 0.90, pf_mode: lag,  curt_cost: 100000.0 }
 
 branches:
-  - { branch_i: 1,  f_bus: 1,  t_bus: 2,  r: 0.0922, x: 0.0470, rateA: 50.0, status: 1 }
+  - { branch_i: 1,  f_bus: 1,  t_bus: 2,  r: 0.0922, x: 0.0470, rateA: 200.0,status: 1 }
   - { branch_i: 2,  f_bus: 2,  t_bus: 3,  r: 0.4930, x: 0.2511, rateA: 50.0, status: 1 }
   - { branch_i: 3,  f_bus: 3,  t_bus: 4,  r: 0.3660, x: 0.1864, rateA: 50.0, status: 1 }
   - { branch_i: 4,  f_bus: 4,  t_bus: 5,  r: 0.3811, x: 0.1941, rateA: 50.0, status: 1 }
@@ -86,22 +86,22 @@ branches:
   - { branch_i: 37, f_bus: 25, t_bus: 29, r: 0.5000, x: 0.5000, rateA: 50.0, status: 0 }
 
 storages:
-  - { storage_i: 1,  bus_i: 17,  status: 1,  Emax: 5.0,  soc: 0.30,  P_ch: 100.0,  P_dis: -80.0,  pf_mode: lead }
-  - { storage_i: 2,  bus_i: 24,  status: 1,  Emax: 3.0,  soc: 0.50,  P_ch: 80.0,   P_dis: -60.0,  pf_mode: lag  }
-  - { storage_i: 3,  bus_i: 25,  status: 1,  Emax: 3.0,  soc: 0.40,  P_ch: 120.0,  P_dis: -100.0, pf_mode: lead }
-  - { storage_i: 4,  bus_i: 26,  status: 1,  Emax: 5.0,  soc: 0.25,  P_ch: 90.0,   P_dis: -70.0 , pf_mode: lag }
-  - { storage_i: 5,  bus_i: 32,  status: 1,  Emax: 5.0,  soc: 0.35,  P_ch: 60.0,   P_dis: -50.0,  pf_mode: lead }
+  - { storage_i: 1,  bus_i: 17,  status: 1,  Emax: 12.0, soc: 0.60,  P_ch: 220.0,  P_dis: -220.0, pf_mode: lag }
+  - { storage_i: 2,  bus_i: 24,  status: 1,  Emax: 5.0,  soc: 0.50,  P_ch: 120.0,  P_dis: -100.0, pf_mode: lag }
+  - { storage_i: 3,  bus_i: 25,  status: 1,  Emax: 5.0,  soc: 0.40,  P_ch: 150.0,  P_dis: -120.0, pf_mode: lead }
+  - { storage_i: 4,  bus_i: 26,  status: 1,  Emax: 6.0,  soc: 0.25,  P_ch: 120.0,  P_dis: -100.0, pf_mode: lead }
+  - { storage_i: 5,  bus_i: 32,  status: 1,  Emax: 8.0,  soc: 0.50,  P_ch: 120.0,  P_dis: -100.0, pf_mode: lag }
 
 stations:
-  - { station_i: 1,  bus_i: 5,  status: 1, type: DEPOT,       n_plots: 40 }
-  - { station_i: 2,  bus_i: 19, status: 1, type: DEPOT,       n_plots: 40 }
-  - { station_i: 3,  bus_i: 14, status: 1, type: HIGHWAY,     n_plots: 55 }
-  - { station_i: 4,  bus_i: 22, status: 1, type: HIGHWAY,     n_plots: 65 }
-  - { station_i: 5,  bus_i: 32, status: 1, type: HIGHWAY,     n_plots: 70 }
-  - { station_i: 6,  bus_i: 9,  status: 1, type: RESIDENTIAL, n_plots: 50 }
-  - { station_i: 7,  bus_i: 15, status: 1, type: RESIDENTIAL, n_plots: 50 }
-  - { station_i: 8,  bus_i: 20, status: 1, type: RESIDENTIAL, n_plots: 55 }
-  - { station_i: 9,  bus_i: 27, status: 1, type: RESIDENTIAL, n_plots: 65 }
-  - { station_i: 10, bus_i: 24, status: 1, type: RESIDENTIAL, n_plots: 90 }
-  - { station_i: 11, bus_i: 25, status: 1, type: RESIDENTIAL, n_plots: 60 }
-  - { station_i: 12, bus_i: 31, status: 1, type: RESIDENTIAL, n_plots: 70 }
+  - { station_i: 1,  bus_i: 5,  status: 1, type: DEPOT,       n_plots: 50 }
+  - { station_i: 2,  bus_i: 19, status: 1, type: DEPOT,       n_plots: 50 }
+  - { station_i: 3,  bus_i: 14, status: 1, type: HIGHWAY,     n_plots: 74 }
+  - { station_i: 4,  bus_i: 22, status: 1, type: HIGHWAY,     n_plots: 74 }
+  - { station_i: 5,  bus_i: 32, status: 1, type: HIGHWAY,     n_plots: 72 }
+  - { station_i: 6,  bus_i: 9,  status: 1, type: RESIDENTIAL, n_plots: 70 }
+  - { station_i: 7,  bus_i: 15, status: 1, type: RESIDENTIAL, n_plots: 68 }
+  - { station_i: 8,  bus_i: 20, status: 1, type: RESIDENTIAL, n_plots: 66 }
+  - { station_i: 9,  bus_i: 27, status: 1, type: RESIDENTIAL, n_plots: 70 }
+  - { station_i: 10, bus_i: 24, status: 1, type: RESIDENTIAL, n_plots: 70 }
+  - { station_i: 11, bus_i: 25, status: 1, type: RESIDENTIAL, n_plots: 72 }
+  - { station_i: 12, bus_i: 31, status: 1, type: RESIDENTIAL, n_plots: 66 }

@@ -1,0 +1,5 @@
+scenario_base: S3
+scenario: S3_0
+seed: 119
+lookahead_hours: 12
+rolling_interval_minutes: 360

@@ -1,0 +1,19 @@
+scenario: S8
+seed: 150
+grid_yaml: config/IEEE33.yaml
+time_yaml: config/time.yaml
+num_evs: 1000
+weights:
+  V2G: 0.6
+  CAR: 0.3
+  BUS: 0.1
+v2g_opt: 0.6
+rates:
+  V2G: 1.0
+  BUS: 1.0
+  CAR: 3.0
+lookahead_hours_list:
+- 12
+- 18
+- 24
+base_rolling_interval_minutes: 360

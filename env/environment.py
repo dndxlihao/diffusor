@@ -1,15 +1,18 @@
-import gymnasium as gym
-import numpy as np
 import math
-import yaml
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+import gymnasium as gym
+import numpy as np
+import yaml
 from gymnasium.envs.registration import register
-from utils import get_series_value
+
 from DERs.ev import EV
 from core.grid import Grid
-from solvers.opf.linear_distflow import _event_priority, _v2g_priority
+from solvers.opf.linear_distflow import _event_priority, _v2g_priority, _weighted_power_split
+from utils import get_series_value
+
 
 @dataclass(frozen=True)
 class Grid2AIEnvConfig:
@@ -21,47 +24,39 @@ class Grid2AIEnvConfig:
     ev_yaml_path: str = "config/ev.yaml"
     baseline_exogenous_path: str = "results/baseline_1w_exogenous.yaml"
     use_baseline_exogenous: bool = True
-    v_penalty: float = 10000
+    v_penalty: float = 10000.0
     ev_depart_penalty: float = 20.0
     v2g_reward_coeff: float = 5.0
     ev_target_soc: float = 0.9
-    storage_end_soc: float = 0.5
-    storage_end_penalty: float = 200.0
-    branch_overload_penalty: float = 10000
-    soc_violation_penalty: float = 10000
+    storage_terminal_value_coeff: float = 1.0
+    branch_overload_penalty: float = 10000.0
     grid_pmax_mw: float = 100.0
     grid_qmax_mvar: float = 100.0
     grid_limit_penalty: float = 1000.0
     obs_vm_min: float = 0.90
     obs_vm_max: float = 1.10
-    reward_scale: float = 1e-6
+    reward_scale: float = 1e-5
+
 
 def time_steps(horizon_hours: int, resolution_minutes: int) -> Tuple[int, float]:
     delta_t = float(resolution_minutes) / 60.0
     T = int(horizon_hours / delta_t)
     return T, delta_t
 
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return float(min(hi, max(lo, x)))
 
-def _mag01(x: Any):
-    if isinstance(x, np.ndarray):
-        return 0.5 * (x.astype(np.float32) + 1.0)
-    if isinstance(x, (list, tuple)):
-        arr = np.asarray(x, dtype=np.float32)
-        return 0.5 * (arr + 1.0)
-    return 0.5 * (float(x) + 1.0)
-
-def _decode_sign_mode(x: float) -> int:
-    return -1 if float(x) < 0.0 else +1
 
 def _sec_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
     lo = max(int(a0), int(b0))
     hi = min(int(a1), int(b1))
     return max(0, hi - lo)
 
+
 def _ceil_div(a: int, b: int) -> int:
     return int((int(a) + int(b) - 1) // int(b))
+
 
 def load_queue_yaml(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     with open(path, "r", encoding="utf-8") as f:
@@ -72,20 +67,26 @@ def load_queue_yaml(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
     events: List[Dict[str, Any]] = [dict(ev) for ev in events_cfg]
     return stations, events
 
+
 def load_evs(path: str) -> Dict[int, EV]:
     ev_list = EV.load_from_yaml(path)
     return {int(ev.ev_i): ev for ev in ev_list}
+
 
 def load_baseline_exogenous(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
+
 @dataclass
 class ActionLayout:
-    stn_mode: slice
-    stn_mag: slice
+    sto_pnet: slice
+    stn_pch: slice
+    stn_pdis: slice
+    n_sto: int
     n_stn: int
     Ksub: int
+
 
 class Grid2AIEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
@@ -112,8 +113,12 @@ class Grid2AIEnv(gym.Env):
         self.T, self.delta_t = time_steps(self.cfg.horizon_hours, self.cfg.resolution_minutes)
         self.opf_step_s = int(round(self.delta_t * 3600.0))
         self.horizon_s = int(self.cfg.horizon_hours) * 3600
+        self.ev_step_s = int(self.cfg.ev_resolution_seconds)
+        if self.opf_step_s % self.ev_step_s != 0:
+            raise ValueError("resolution_minutes must be an integer multiple of ev_resolution_seconds")
+        self.Ksub = int(self.opf_step_s // self.ev_step_s)
+        self.K_ev = int(_ceil_div(self.horizon_s, self.ev_step_s))
 
-        # get buses
         self.baseMVA = float(self.grid.baseMVA)
         self.buses = list(self.grid.buses)
         self.bus_ids = [int(b.bus_i) for b in self.buses]
@@ -122,66 +127,55 @@ class Grid2AIEnv(gym.Env):
         self.slack = int(self.bus_ids[0])
         self.slack_idx = int(self.bus_to_idx[self.slack])
 
-        # get branches
         self.parent, self.children, edges3 = self.grid.build_radial_tree()
         self.edges: List[Tuple[int, int]] = []
-        self.edge_branch_id: List[int] = []
-        self.r_pu: np.ndarray = np.zeros((len(edges3),), dtype=np.float64)
-        self.x_pu: np.ndarray = np.zeros((len(edges3),), dtype=np.float64)
-        self.smax_pu: np.ndarray = np.zeros((len(edges3),), dtype=np.float64)
+        self.r_pu = np.zeros((len(edges3),), dtype=np.float64)
+        self.x_pu = np.zeros((len(edges3),), dtype=np.float64)
+        self.smax_pu = np.zeros((len(edges3),), dtype=np.float64)
         br_dict = {int(getattr(br, "branch_i")): br for br in (self.grid.branches or [])}
         for k, (i, j, br_i) in enumerate(edges3):
-            i = int(i)
-            j = int(j)
-            br_i = int(br_i)
-            self.edges.append((i, j))
-            self.edge_branch_id.append(br_i)
-            br = br_dict.get(br_i, None)
+            edge = (int(i), int(j))
+            self.edges.append(edge)
+            br = br_dict.get(int(br_i))
             z = self.grid.branch_z_pu(br)
             self.r_pu[k] = float(z.real)
             self.x_pu[k] = float(z.imag)
-            rateA = float(getattr(br, "rateA", 50.0))
-            self.smax_pu[k] = rateA / self.baseMVA
+            self.smax_pu[k] = float(getattr(br, "rateA", 50.0)) / self.baseMVA
         self.ne = len(self.edges)
         self._edge_index: Dict[Tuple[int, int], int] = {e: k for k, e in enumerate(self.edges)}
         self._fwd_order, self._post_order = self._precompute_tree_orders()
 
-        # get generators
         self.gens = [g for g in (self.grid.generators or []) if int(getattr(g, "status", 1)) == 1]
         self.gen_ids = [int(getattr(g, "gen_i")) for g in self.gens]
         self.n_gen = len(self.gen_ids)
 
-        # get renewables
         self.rens = [r for r in (self.grid.renewables or []) if int(getattr(r, "status", 1)) == 1]
         self.ren_ids = [int(getattr(r, "renewable_i")) for r in self.rens]
         self.n_ren = len(self.ren_ids)
 
-        # get storages
         self.stos = [s for s in (self.grid.storages or []) if int(getattr(s, "status", 1)) == 1]
         self.sto_ids = [int(getattr(s, "storage_i")) for s in self.stos]
         self.n_sto = len(self.sto_ids)
 
-        # get EV events
         self.stations_cfg, self.events_cfg = load_queue_yaml(self.cfg.queue_yaml_path)
         if not self.stations_cfg:
-            self.stations_cfg = [dict(st.to_config()) for st in (self.grid.stations or []) if int(getattr(st, "status", 1)) == 1]
+            self.stations_cfg = [
+                dict(st.to_config()) for st in (self.grid.stations or []) if int(getattr(st, "status", 1)) == 1
+            ]
         self.station_by_id = {int(s["station_i"]): dict(s) for s in self.stations_cfg}
-        self.station_bus = {sid: int(self.station_by_id[sid]["bus_i"]) for sid in self.station_by_id}
         self.station_ids = sorted(int(sid) for sid in self.station_by_id)
         self.station_to_idx = {int(sid): i for i, sid in enumerate(self.station_ids)}
         self.n_stn = len(self.station_ids)
+        self.station_bus = {sid: int(self.station_by_id[sid]["bus_i"]) for sid in self.station_by_id}
         self.station_bus_idx = np.asarray(
             [int(self.bus_to_idx.get(int(self.station_bus[sid]), -1)) for sid in self.station_ids],
             dtype=np.int64,
         )
+
         self.event_ids = [int(e["event_i"]) for e in self.events_cfg]
         self.event_by_id = {int(e["event_i"]): dict(e) for e in self.events_cfg}
         self.n_ev = len(self.event_ids)
         self.ev_by_id = load_evs(self.cfg.ev_yaml_path)
-
-        self.ev_step_s = int(self.cfg.ev_resolution_seconds)
-        self.K_ev = int(_ceil_div(self.horizon_s, self.ev_step_s))
-        self.Ksub = int(self.opf_step_s // self.ev_step_s)
 
         self.price = np.zeros((self.T,), dtype=np.float64)
         for tt in range(self.T):
@@ -191,18 +185,16 @@ class Grid2AIEnv(gym.Env):
         for k in range(self.K_ev):
             self.price_ev[k] = float(get_series_value(self.cfg.time_yaml_path, "price", t=int(k * self.ev_step_s)))
 
-        # bus params
         self.Pd_pu = np.zeros((self.T, self.nb), dtype=np.float64)
         self.Qd_pu = np.zeros((self.T, self.nb), dtype=np.float64)
         for tt in range(self.T):
             t_sec = int(tt * self.opf_step_s)
-            for bi, b in enumerate(self.bus_ids):
-                bus = self.grid.get_bus(int(b))
+            for bi, bid in enumerate(self.bus_ids):
+                bus = self.grid.get_bus(int(bid))
                 Pd, Qd = self.grid.bus_PQ_pu(bus, t=t_sec)
                 self.Pd_pu[tt, bi] = float(Pd)
                 self.Qd_pu[tt, bi] = float(Qd)
 
-        # renewable params
         self.Pav_pu = np.zeros((self.T, self.n_ren), dtype=np.float64)
         for tt in range(self.T):
             t_sec = int(tt * self.opf_step_s)
@@ -210,7 +202,6 @@ class Grid2AIEnv(gym.Env):
                 pav_mw = float(self.grid.renewable_pav_mw(int(rid), t=t_sec))
                 self.Pav_pu[tt, ri] = pav_mw / self.baseMVA
 
-        # generator params
         self.gen_bus_idx = np.zeros((self.n_gen,), dtype=np.int64)
         self.Pmin_pu = np.zeros((self.n_gen,), dtype=np.float64)
         self.Pmax_pu = np.zeros((self.n_gen,), dtype=np.float64)
@@ -229,26 +220,6 @@ class Grid2AIEnv(gym.Env):
             self.cost_c1[i] = float(getattr(g, "cost_c1", 100.0))
             self.cost_c0[i] = float(getattr(g, "cost_c0", 2500.0))
 
-        # storage params
-        self.sto_bus_idx = np.zeros((self.n_sto,), dtype=np.int64)
-        self.sto_Emax = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_soc0 = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_Pch_max = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_Pdis_max = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_eta_ch = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_eta_dis = np.zeros((self.n_sto,), dtype=np.float64)
-        self.sto_q_coeff = np.zeros((self.n_sto,), dtype=np.float64)
-        for i, s in enumerate(self.stos):
-            self.sto_bus_idx[i] = int(self.bus_to_idx[int(getattr(s, "bus_i"))])
-            self.sto_Emax[i] = float(getattr(s, "Emax"))
-            self.sto_soc0[i] = float(getattr(s, "soc", 0.5))
-            self.sto_Pch_max[i] = float(getattr(s, "P_ch")) / 1000.0
-            self.sto_Pdis_max[i] = abs(float(getattr(s, "P_dis"))) / 1000.0
-            self.sto_eta_ch[i] = float(getattr(s, "eta_ch", 0.95))
-            self.sto_eta_dis[i] = float(getattr(s, "eta_dis", 0.95))
-            self.sto_q_coeff[i] = float(s.calculate_Qg(Pg=1.0))
-
-        # renewable params
         self.ren_bus_idx = np.zeros((self.n_ren,), dtype=np.int64)
         self.ren_curt_cost = np.zeros((self.n_ren,), dtype=np.float64)
         self.ren_q_coeff = np.zeros((self.n_ren,), dtype=np.float64)
@@ -257,98 +228,76 @@ class Grid2AIEnv(gym.Env):
             self.ren_curt_cost[i] = float(getattr(r, "curt_cost", 100000.0))
             self.ren_q_coeff[i] = float(r.calculate_Qg(Pg=1.0))
 
-        # EV per-event params
+        self.sto_bus_idx = np.zeros((self.n_sto,), dtype=np.int64)
+        self.sto_Emax = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_soc0 = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_Pch_max_mw = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_Pdis_max_mw = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_eta_ch = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_eta_dis = np.zeros((self.n_sto,), dtype=np.float64)
+        self.sto_q_coeff = np.zeros((self.n_sto,), dtype=np.float64)
+        for i, s in enumerate(self.stos):
+            self.sto_bus_idx[i] = int(self.bus_to_idx[int(getattr(s, "bus_i"))])
+            self.sto_Emax[i] = float(getattr(s, "Emax"))
+            self.sto_soc0[i] = float(getattr(s, "soc", 0.5))
+            self.sto_Pch_max_mw[i] = float(getattr(s, "P_ch")) / 1000.0
+            self.sto_Pdis_max_mw[i] = abs(float(getattr(s, "P_dis"))) / 1000.0
+            self.sto_eta_ch[i] = float(getattr(s, "eta_ch", 0.95))
+            self.sto_eta_dis[i] = float(getattr(s, "eta_dis", 0.95))
+            self.sto_q_coeff[i] = float(s.calculate_Qg(Pg=1.0))
+
         self.ev_bus_idx = np.full((self.n_ev,), -1, dtype=np.int64)
         self.ev_station_idx = np.full((self.n_ev,), -1, dtype=np.int64)
-        self.ev_vehicle_idx = np.full((self.n_ev,), -1, dtype=np.int64)
         self.ev_ev_i = np.full((self.n_ev,), -1, dtype=np.int64)
         self.ev_cap_kwh = np.zeros((self.n_ev,), dtype=np.float64)
         self.ev_pch_max_kw = np.zeros((self.n_ev,), dtype=np.float64)
         self.ev_pdis_max_kw = np.zeros((self.n_ev,), dtype=np.float64)
         self.ev_eta_ch = np.zeros((self.n_ev,), dtype=np.float64)
         self.ev_eta_dis = np.zeros((self.n_ev,), dtype=np.float64)
-        self.ev_dis_ok = np.ones((self.n_ev,), dtype=np.int64)
+        self.ev_dis_ok = np.zeros((self.n_ev,), dtype=np.int64)
         self.ev_min_soc = np.zeros((self.n_ev,), dtype=np.float64)
         self.ev_arr_k = np.zeros((self.n_ev,), dtype=np.int64)
         self.ev_start_k = np.zeros((self.n_ev,), dtype=np.int64)
         self.ev_dep_k = np.zeros((self.n_ev,), dtype=np.int64)
+        self.ev_arr_s_abs = np.zeros((self.n_ev,), dtype=np.int64)
+        self.ev_dep_s_abs = np.zeros((self.n_ev,), dtype=np.int64)
         self.ev_active_slot = np.zeros((self.K_ev, self.n_ev), dtype=np.int64)
         self.ev_dt_slot_s = np.zeros((self.K_ev, self.n_ev), dtype=np.float64)
-        self.vehicle_ids = np.asarray(sorted(int(eid) for eid in self.ev_by_id.keys()), dtype=np.int64)
-        self.n_vehicle = int(len(self.vehicle_ids))
-        self.vehicle_to_idx = {int(eid): i for i, eid in enumerate(self.vehicle_ids)}
-        self.vehicle_soc0 = np.zeros((self.n_vehicle,), dtype=np.float64)
-        self.vehicle_soc = np.zeros((self.n_vehicle,), dtype=np.float64)
-        for vi, ev_i in enumerate(self.vehicle_ids):
-            self.vehicle_soc0[vi] = _clamp(float(getattr(self.ev_by_id[int(ev_i)], "soc", 0.5)), 0.0, 1.0)
-        self.station_energy_kwh = np.zeros((self.n_stn,), dtype=np.float64)
-        self.station_req_cum_kwh = np.zeros((self.n_stn, self.K_ev + 1), dtype=np.float64)
-        self.station_due_flag = np.zeros((self.n_stn, self.K_ev + 1), dtype=np.int64)
+        self.event_soc0 = np.zeros((self.n_ev,), dtype=np.float64)
+        self.event_soc = np.zeros((self.n_ev,), dtype=np.float64)
+        self.next_event_idx = np.full((self.n_ev,), -1, dtype=np.int64)
+        self.event_closed = np.zeros((self.n_ev,), dtype=np.int8)
         self._ev_obj_per_event: List[Optional[EV]] = [None] * self.n_ev
-        self._ev_v2g_minsoc: np.ndarray = np.zeros((self.n_ev,), dtype=np.float64)
+        self._ev_v2g_minsoc = np.zeros((self.n_ev,), dtype=np.float64)
         self._init_ev_static_and_activity()
-        self._init_station_due_demand()
         self._init_exogenous_sequences()
 
         self._active_evs_by_k: List[np.ndarray] = []
         for k in range(self.K_ev):
-            idxs = np.nonzero(self.ev_active_slot[k, :])[0].astype(np.int64)
-            self._active_evs_by_k.append(idxs)
+            self._active_evs_by_k.append(np.nonzero(self.ev_active_slot[k, :])[0].astype(np.int64))
 
-        # action/obs spaces
         self._layout = self._build_action_layout()
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self._action_dim(),), dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self._obs_dim(),), dtype=np.float32)
 
-        # state variables
         self._t = 0
         self.sto_soc = np.zeros((self.n_sto,), dtype=np.float64)
         self.v2 = np.ones((self.nb,), dtype=np.float64)
         self.Pij = np.zeros((self.ne,), dtype=np.float64)
         self.Qij = np.zeros((self.ne,), dtype=np.float64)
 
-        # last actions decoded (for obs)
         self.last_Pg_pu = np.zeros((self.n_gen,), dtype=np.float64)
         self.last_Qg_pu = np.zeros((self.n_gen,), dtype=np.float64)
         self.last_ren_frac = np.zeros((self.n_ren,), dtype=np.float64)
         self.last_sto_pnet_pu = np.zeros((self.n_sto,), dtype=np.float64)
-        self.last_ev_pnet_pu = np.zeros((self.n_ev,), dtype=np.float64)
         self.last_stn_pnet_mw = np.zeros((self.n_stn,), dtype=np.float64)
-
-        # last grid buy/sell
         self.last_P_buy_pu = 0.0
         self.last_P_sell_pu = 0.0
         self.last_Q_grid_pu = 0.0
         self.last_grid_P_excess_pu = 0.0
         self.last_grid_Q_excess_pu = 0.0
-
-    def _action_dim(self) -> int:
-        return int(self._layout.stn_mag.stop)
-
-    def _obs_dim(self) -> int:
-        return (
-            3
-            + 3 * self.nb
-            + 2 * self.n_gen
-            + 2 * self.n_ren
-            + 2 * self.n_sto
-            + 8 * self.n_stn
-        )
-
-    def _build_action_layout(self) -> ActionLayout:
-        idx = 0
-        n_stnslot = self.n_stn * self.Ksub
-        stn_mode = slice(idx, idx + n_stnslot)
-        idx += n_stnslot
-        stn_mag = slice(idx, idx + n_stnslot)
-        idx += n_stnslot
-
-        return ActionLayout(
-            stn_mode=stn_mode,
-            stn_mag=stn_mag,
-            n_stn=self.n_stn,
-            Ksub=self.Ksub,
-        )
+        self._trace_enabled = False
+        self._trace: Dict[str, Any] = {}
 
     def _precompute_tree_orders(self) -> Tuple[List[int], List[int]]:
         depth: Dict[int, int] = {self.slack: 0}
@@ -361,10 +310,65 @@ class Grid2AIEnv(gym.Env):
                 c = int(c)
                 depth[c] = depth[u] + 1
                 stack.append(c)
-
         fwd = sorted(order, key=lambda x: depth.get(int(x), 0))
         post = sorted(order, key=lambda x: depth.get(int(x), 0), reverse=True)
         return fwd, post
+
+    def _build_action_layout(self) -> ActionLayout:
+        idx = 0
+        sto_pnet = slice(idx, idx + self.n_sto)
+        idx += self.n_sto
+        stn_pch = slice(idx, idx + self.n_stn * self.Ksub)
+        idx += self.n_stn * self.Ksub
+        stn_pdis = slice(idx, idx + self.n_stn * self.Ksub)
+        idx += self.n_stn * self.Ksub
+        return ActionLayout(
+            sto_pnet=sto_pnet,
+            stn_pch=stn_pch,
+            stn_pdis=stn_pdis,
+            n_sto=self.n_sto,
+            n_stn=self.n_stn,
+            Ksub=self.Ksub,
+        )
+
+    def _action_dim(self) -> int:
+        return int(self._layout.stn_pdis.stop)
+
+    def _obs_dim(self) -> int:
+        return 3 + 3 * self.nb + 2 * self.n_gen + 2 * self.n_ren + 2 * self.n_sto + 8 * self.n_stn
+
+    def _init_trace(self) -> None:
+        self._trace = {
+            "Pg": {},
+            "Qg": {},
+            "Pr": {},
+            "curt": {},
+            "Vu": {},
+            "Vl": {},
+            "P_buy": {},
+            "P_sell": {},
+            "P_ch": {},
+            "P_dis": {},
+            "soc": {},
+            "st_pch": {},
+            "st_pdis": {},
+            "event_pch_kw": {},
+            "event_pdis_kw": {},
+            "event_soc_init": {},
+            "final_soc": {},
+            "unmet_departure_kwh": {},
+        }
+
+    def enable_trace(self) -> None:
+        self._trace_enabled = True
+        self._init_trace()
+
+    def disable_trace(self) -> None:
+        self._trace_enabled = False
+        self._trace = {}
+
+    def get_trace(self) -> Dict[str, Any]:
+        return dict(self._trace)
 
     def _init_ev_static_and_activity(self) -> None:
         for ei, eid in enumerate(self.event_ids):
@@ -372,30 +376,32 @@ class Grid2AIEnv(gym.Env):
             ev_i = int(e["ev_i"])
             station_i = int(e["station_i"])
             bus_i = int(self.station_bus.get(station_i, 0))
+            ev_obj = self.ev_by_id.get(ev_i)
 
             self.ev_ev_i[ei] = int(ev_i)
             self.ev_bus_idx[ei] = int(self.bus_to_idx.get(bus_i, -1))
-            self.ev_station_idx[ei] = int(self.station_to_idx.get(int(station_i), -1))
-            self.ev_vehicle_idx[ei] = int(self.vehicle_to_idx.get(ev_i, -1))
+            self.ev_station_idx[ei] = int(self.station_to_idx.get(station_i, -1))
+            self._ev_obj_per_event[ei] = ev_obj
 
             arr = int(e.get("arrival_t", 0))
             st = int(e.get("start_t", arr))
             dep = int(e.get("departure_t", st))
-            if dep < st or st < 0:
-                dep = st
+            dep = max(st, dep)
+            self.ev_arr_s_abs[ei] = int(arr)
+            self.ev_dep_s_abs[ei] = int(dep)
             self.ev_arr_k[ei] = int(arr // self.ev_step_s)
             self.ev_start_k[ei] = int(st // self.ev_step_s)
             self.ev_dep_k[ei] = int(_ceil_div(dep, self.ev_step_s))
 
-            ev_obj = self.ev_by_id.get(ev_i, None)
-            self._ev_obj_per_event[ei] = ev_obj
+            soc0 = float(e.get("soc_init", getattr(ev_obj, "soc", 0.5) if ev_obj is not None else 0.5))
+            self.event_soc0[ei] = _clamp(soc0, 0.0, 1.0)
+            self.event_soc[ei] = self.event_soc0[ei]
 
-            # default-safe reads
-            self.ev_cap_kwh[ei] = float(getattr(ev_obj, "capacity", 0.0))
-            self.ev_pch_max_kw[ei] = float(getattr(ev_obj, "p_ch", 0.0))
-            self.ev_pdis_max_kw[ei] = float(getattr(ev_obj, "p_dis", 0.0))
-            self.ev_eta_ch[ei] = float(getattr(ev_obj, "eta_ch", 1.0))
-            self.ev_eta_dis[ei] = float(getattr(ev_obj, "eta_dis", 1.0))
+            self.ev_cap_kwh[ei] = float(getattr(ev_obj, "capacity", 0.0)) if ev_obj is not None else 0.0
+            self.ev_pch_max_kw[ei] = float(getattr(ev_obj, "p_ch", 0.0)) if ev_obj is not None else 0.0
+            self.ev_pdis_max_kw[ei] = float(getattr(ev_obj, "p_dis", 0.0)) if ev_obj is not None else 0.0
+            self.ev_eta_ch[ei] = float(getattr(ev_obj, "eta_ch", 1.0)) if ev_obj is not None else 1.0
+            self.ev_eta_dis[ei] = float(getattr(ev_obj, "eta_dis", 1.0)) if ev_obj is not None else 1.0
 
             minsoc = 0.0
             if ev_obj is not None and hasattr(ev_obj, "v2g_minsoc"):
@@ -404,7 +410,6 @@ class Grid2AIEnv(gym.Env):
                 except Exception:
                     minsoc = 0.0
             self._ev_v2g_minsoc[ei] = minsoc
-
             self.ev_dis_ok[ei] = 1 if bool(getattr(ev_obj, "v2g_cap", False)) else 0
             self.ev_min_soc[ei] = minsoc
 
@@ -415,54 +420,41 @@ class Grid2AIEnv(gym.Env):
                 if ov > 0:
                     self.ev_active_slot[k, ei] = 1
                     self.ev_dt_slot_s[k, ei] = float(ov)
-                else:
-                    self.ev_active_slot[k, ei] = 0
-                    self.ev_dt_slot_s[k, ei] = 0.0
 
-    def _init_station_due_demand(self) -> None:
-        self.station_req_cum_kwh[:] = 0.0
-        self.station_due_flag[:] = 0
-        for ei, eid in enumerate(self.event_ids):
-            si = int(self.ev_station_idx[ei])
-            if si < 0:
-                continue
-            ev_i = int(self.ev_ev_i[ei])
-            ev_obj = self.ev_by_id.get(ev_i)
-            if ev_obj is None:
-                continue
-            e = self.event_by_id[eid]
-            soc0 = float(e.get("soc_init", getattr(ev_obj, "soc", 0.5)))
-            req_kwh = max(0.0, (float(self.cfg.ev_target_soc) - soc0) * float(ev_obj.capacity))
-            dep_k = int(min(max(0, self.ev_dep_k[ei]), self.K_ev))
-            self.station_req_cum_kwh[si, dep_k] += float(req_kwh)
-            self.station_due_flag[si, dep_k] = 1
-        self.station_req_cum_kwh = np.cumsum(self.station_req_cum_kwh, axis=1)
+        ev_indices_by_vehicle: Dict[int, List[int]] = {}
+        for ei in range(self.n_ev):
+            ev_indices_by_vehicle.setdefault(int(self.ev_ev_i[ei]), []).append(int(ei))
+        for idxs in ev_indices_by_vehicle.values():
+            idxs.sort(key=lambda idx: (int(self.ev_arr_s_abs[idx]), int(self.event_ids[idx])))
+            for pos in range(len(idxs) - 1):
+                self.next_event_idx[int(idxs[pos])] = int(idxs[pos + 1])
 
     def _init_exogenous_sequences(self) -> None:
         self.exo_gen_P_pu = np.zeros((self.T, self.n_gen), dtype=np.float64)
         self.exo_gen_Q_pu = np.zeros((self.T, self.n_gen), dtype=np.float64)
         self.exo_ren_Pr_pu = np.zeros((self.T, self.n_ren), dtype=np.float64)
-        self.exo_sto_pnet_pu = np.zeros((self.T, self.n_sto), dtype=np.float64)
-        self.exo_sto_soc = np.tile(self.sto_soc0.reshape(1, -1), (self.T, 1)) if self.n_sto > 0 else np.zeros((self.T, 0), dtype=np.float64)
 
         if not bool(self.cfg.use_baseline_exogenous):
+            for tt in range(self.T):
+                self.exo_ren_Pr_pu[tt, :] = self.Pav_pu[tt, :]
             return
 
-        doc = load_baseline_exogenous(self.cfg.baseline_exogenous_path)
-        if not doc:
-            raise FileNotFoundError(f"baseline exogenous file not found or empty: {self.cfg.baseline_exogenous_path}")
+        path = Path(self.cfg.baseline_exogenous_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"baseline exogenous file not found: {path}. Generate it from baseline solver output first."
+            )
+        doc = load_baseline_exogenous(str(path))
 
-        def _load_matrix(key: str, rows: int, cols: int) -> np.ndarray:
+        def _load_matrix_required(key: str, rows: int, cols: int) -> np.ndarray:
             arr = np.asarray(doc.get(key, []), dtype=np.float64)
             if arr.shape != (rows, cols):
                 raise ValueError(f"{key} shape mismatch: expected {(rows, cols)}, got {arr.shape}")
             return arr
 
-        self.exo_gen_P_pu = _load_matrix("gen_P_pu", self.T, self.n_gen)
-        self.exo_gen_Q_pu = _load_matrix("gen_Q_pu", self.T, self.n_gen)
-        self.exo_ren_Pr_pu = _load_matrix("ren_Pr_pu", self.T, self.n_ren)
-        self.exo_sto_pnet_pu = _load_matrix("sto_pnet_pu", self.T, self.n_sto)
-        self.exo_sto_soc = _load_matrix("sto_soc", self.T, self.n_sto)
+        self.exo_gen_P_pu = _load_matrix_required("gen_P_pu", self.T, self.n_gen)
+        self.exo_gen_Q_pu = _load_matrix_required("gen_Q_pu", self.T, self.n_gen)
+        self.exo_ren_Pr_pu = _load_matrix_required("ren_Pr_pu", self.T, self.n_ren)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -470,15 +462,69 @@ class Grid2AIEnv(gym.Env):
             self._rng = np.random.default_rng(seed)
 
         self._t = 0
+        self.sto_soc[:] = self.sto_soc0
+        self.event_soc[:] = self.event_soc0
+        self.event_closed[:] = 0
         self.v2[:] = 1.0
         self.Pij[:] = 0.0
         self.Qij[:] = 0.0
-        self.sto_soc[:] = self.sto_soc0
-        self.vehicle_soc[:] = self.vehicle_soc0
-        self.station_energy_kwh[:] = 0.0
+        if self._trace_enabled:
+            self._init_trace()
+            for ei, eid in enumerate(self.event_ids):
+                self._trace["event_soc_init"][int(eid)] = float(self.event_soc[ei])
+            for si, sid in enumerate(self.sto_ids):
+                self._trace["soc"][(int(sid), 0)] = float(self.sto_soc[si])
 
-        self._simulate_step(np.zeros((self._action_dim(),), dtype=np.float32), update_states=True)
+        zero_action = np.zeros((self._action_dim(),), dtype=np.float32)
+        self._simulate_step(zero_action, update_states=False)
         return self._get_obs(), {}
+
+    def _event_target_shortfall_kwh(self, ei: int) -> float:
+        target_soc = min(1.0, float(self.cfg.ev_target_soc))
+        return max(0.0, (target_soc - float(self.event_soc[ei])) * float(self.ev_cap_kwh[ei]))
+
+    def _estimate_trip_soc_drop(self, ei: int, gap_s: int) -> float:
+        ev_obj = self._ev_obj_per_event[int(ei)]
+        ev_type = str(getattr(ev_obj, "type", "V2G")).upper() if ev_obj is not None else "V2G"
+        gap_h = max(0.0, float(gap_s) / 3600.0)
+        if ev_type == "V2G":
+            return min(0.30, 0.08 + 0.015 * gap_h)
+        if ev_type == "BUS":
+            return min(0.42, 0.14 + 0.02 * gap_h)
+        if ev_type == "CAR":
+            return min(0.22, 0.05 + 0.012 * gap_h)
+        return min(0.25, 0.08 + 0.012 * gap_h)
+
+    def _propagate_departed_event_soc(self, slot_end_k: int) -> None:
+        for ei in range(self.n_ev):
+            if int(self.event_closed[ei]) == 1:
+                continue
+            if int(self.ev_dep_k[ei]) > int(slot_end_k):
+                continue
+            self.event_closed[ei] = 1
+            if self._trace_enabled:
+                eid = int(self.event_ids[ei])
+                final_soc = float(self.event_soc[ei])
+                self._trace["final_soc"][eid] = final_soc
+                self._trace["unmet_departure_kwh"][eid] = self._event_target_shortfall_kwh(ei)
+            next_ei = int(self.next_event_idx[ei])
+            if next_ei < 0:
+                continue
+            gap_s = max(0, int(self.ev_arr_s_abs[next_ei]) - int(self.ev_dep_s_abs[ei]))
+            next_soc = max(0.0, float(self.event_soc[ei]) - self._estimate_trip_soc_drop(ei, gap_s))
+            self.event_soc[next_ei] = float(next_soc)
+            if self._trace_enabled:
+                self._trace["event_soc_init"][int(self.event_ids[next_ei])] = float(next_soc)
+
+    def _event_departure_shortfall_step(self, k_prev: int, k_end: int) -> Tuple[float, float]:
+        total_short_kwh = 0.0
+        for ei in range(self.n_ev):
+            dep_k = int(self.ev_dep_k[ei])
+            if dep_k <= k_prev or dep_k > k_end:
+                continue
+            total_short_kwh += self._event_target_shortfall_kwh(ei)
+        penalty = float(self.cfg.ev_depart_penalty) * total_short_kwh
+        return penalty, total_short_kwh
 
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -493,12 +539,17 @@ class Grid2AIEnv(gym.Env):
         terminated = self._t >= self.T
         truncated = False
 
-        if terminated:
-            if float(self.cfg.storage_end_penalty) > 0.0 and self.n_sto > 0:
-                short = np.maximum(0.0, float(self.cfg.storage_end_soc) - self.sto_soc)
-                term_pen = float(self.cfg.storage_end_penalty) * float(np.sum(short))
-                step_cost += term_pen
-                info["storage_terminal_penalty"] = float(term_pen)
+        if terminated and float(self.cfg.storage_terminal_value_coeff) != 0.0 and self.n_sto > 0:
+            terminal_price = float(self.price[self.T - 1]) if self.T > 0 else 0.0
+            terminal_energy_mwh = float(np.sum(self.sto_Emax * self.sto_soc))
+            terminal_value = (
+                float(self.cfg.storage_terminal_value_coeff)
+                * terminal_price
+                * terminal_energy_mwh
+                * 1000.0
+            )
+            step_cost -= terminal_value
+            info["storage_terminal_value"] = float(terminal_value)
 
         raw_reward = -float(step_cost)
         reward = raw_reward * float(self.cfg.reward_scale)
@@ -507,13 +558,11 @@ class Grid2AIEnv(gym.Env):
         info["step_cost_total"] = float(step_cost)
         info["raw_reward"] = float(raw_reward)
         info["scaled_reward"] = float(reward)
-
         return obs, reward, terminated, truncated, info
 
     def _simulate_step(self, action: np.ndarray, *, update_states: bool) -> Tuple[float, Dict[str, Any]]:
         tt = int(self._t)
 
-        # fixed non-EV trajectories from baseline
         Pg_pu = self.exo_gen_P_pu[tt, :].copy()
         Qg_pu = self.exo_gen_Q_pu[tt, :].copy()
         self.last_Pg_pu[:] = Pg_pu
@@ -528,195 +577,229 @@ class Grid2AIEnv(gym.Env):
 
         Pav = self.Pav_pu[tt, :]
         Pr = np.minimum(np.maximum(self.exo_ren_Pr_pu[tt, :], 0.0), Pav)
-        frac = np.divide(Pr, np.maximum(Pav, 1e-9))
-        self.last_ren_frac[:] = frac
+        self.last_ren_frac[:] = np.divide(Pr, np.maximum(Pav, 1e-9))
         curt = np.maximum(0.0, Pav - Pr)
+        if update_states and self._trace_enabled:
+            for gi, gid in enumerate(self.gen_ids):
+                self._trace["Pg"][(int(gid), tt)] = float(Pg_pu[gi])
+                self._trace["Qg"][(int(gid), tt)] = float(Qg_pu[gi])
+            for ri, rid in enumerate(self.ren_ids):
+                self._trace["Pr"][(int(rid), tt)] = float(Pr[ri])
+                self._trace["curt"][(int(rid), tt)] = float(curt[ri])
         for ri in range(self.n_ren):
             bi = int(self.ren_bus_idx[ri])
             P_inj[bi] += float(Pr[ri])
             Q_inj[bi] += float(self.ren_q_coeff[ri] * Pr[ri])
 
-        pnet_sto_pu = np.zeros((self.n_sto,), dtype=np.float64)
-        soc_pen = 0.0
+        sto_action = action[self._layout.sto_pnet]
+        sto_pnet_load_pu = np.zeros((self.n_sto,), dtype=np.float64)
         for si in range(self.n_sto):
-            pnet_sto_pu[si] = float(self.exo_sto_pnet_pu[tt, si])
-            soc_next = _clamp(float(self.exo_sto_soc[tt, si]), 0.0, 1.0)
+            a = float(sto_action[si]) if self.n_sto > 0 else 0.0
+            if update_states and self._trace_enabled:
+                self._trace["soc"][(int(self.sto_ids[si]), tt)] = float(self.sto_soc[si])
+            charge_mw = max(0.0, a) * float(self.sto_Pch_max_mw[si])
+            discharge_mw = max(0.0, -a) * float(self.sto_Pdis_max_mw[si])
+            delta_e = (float(self.sto_eta_ch[si]) * charge_mw - discharge_mw / max(1e-6, float(self.sto_eta_dis[si]))) * float(self.delta_t)
+            soc_next = _clamp(float(self.sto_soc[si]) + delta_e / max(1e-6, float(self.sto_Emax[si])), 0.0, 1.0)
             if update_states:
                 self.sto_soc[si] = soc_next
+                if self._trace_enabled:
+                    sid = int(self.sto_ids[si])
+                    self._trace["P_ch"][(sid, tt)] = float(charge_mw / self.baseMVA)
+                    self._trace["P_dis"][(sid, tt)] = float(discharge_mw / self.baseMVA)
+                    self._trace["soc"][(sid, tt + 1)] = float(soc_next)
 
+            pnet_load_mw = charge_mw - discharge_mw
+            sto_pnet_load_pu[si] = pnet_load_mw / self.baseMVA
+            pnet_inj_pu = -sto_pnet_load_pu[si]
             bi = int(self.sto_bus_idx[si])
-            P_inj[bi] += float(pnet_sto_pu[si])
-            Q_inj[bi] += float(self.sto_q_coeff[si] * pnet_sto_pu[si])
+            P_inj[bi] += float(pnet_inj_pu)
+            Q_inj[bi] += float(self.sto_q_coeff[si] * pnet_inj_pu)
+        self.last_sto_pnet_pu[:] = sto_pnet_load_pu
 
-        self.last_sto_pnet_pu[:] = pnet_sto_pu
-
-        # EV actions: station-level action, vehicle-level greedy allocation
         ev_pnet_pu = np.zeros((self.n_ev,), dtype=np.float64)
         stn_net_mw = np.zeros((self.n_stn,), dtype=np.float64)
         v2g_value = 0.0
-        ev_soc_pen = 0.0
         ev_depart_pen_step = 0.0
-        stn_energy_delta_kwh = np.zeros((self.n_stn,), dtype=np.float64)
 
-        if self.n_ev > 0 and self.Ksub > 0 and self.n_stn > 0:
-            stn_mode_raw = action[self._layout.stn_mode]
-            stn_mag = np.clip(_mag01(action[self._layout.stn_mag]), 0.0, 0.0 + 1.0)
-            net_kw_avg = np.zeros((self.n_ev,), dtype=np.float64)
-            opf_step_s_f = float(self.opf_step_s)
-            ev_step_s_i = int(self.ev_step_s)
+        if self.n_stn > 0:
+            stn_pch_action = np.clip(action[self._layout.stn_pch], 0.0, 1.0).reshape(self.Ksub, self.n_stn)
+            stn_pdis_action = np.clip(action[self._layout.stn_pdis], 0.0, 1.0).reshape(self.Ksub, self.n_stn)
+        else:
+            stn_pch_action = np.zeros((self.Ksub, 0), dtype=np.float64)
+            stn_pdis_action = np.zeros((self.Ksub, 0), dtype=np.float64)
+        opf_step_s_f = float(self.opf_step_s)
 
-            for sub in range(self.Ksub):
-                k_global = tt * self.Ksub + sub
-                if k_global < 0 or k_global >= self.K_ev:
+        for sub in range(self.Ksub):
+            k_global = tt * self.Ksub + sub
+            if k_global < 0 or k_global >= self.K_ev:
+                continue
+            active_eis = self._active_evs_by_k[k_global]
+            if active_eis.size == 0:
+                continue
+            price_k = float(self.price_ev[k_global])
+
+            by_station: Dict[int, List[int]] = {si: [] for si in range(self.n_stn)}
+            for ei in active_eis:
+                si = int(self.ev_station_idx[ei])
+                if si >= 0:
+                    by_station[si].append(int(ei))
+
+            for si in range(self.n_stn):
+                station_eis = by_station.get(si, [])
+                if not station_eis:
                     continue
-                price_k = float(self.price_ev[k_global])
-                active_eis = self._active_evs_by_k[k_global]
-                if active_eis.size == 0:
-                    continue
+                charge_cap_total_kw = 0.0
+                discharge_cap_total_kw = 0.0
+                weighted_ch: List[Tuple[float, int, float]] = []
+                weighted_dis: List[Tuple[float, int, float]] = []
+                charge_info: Dict[int, Tuple[float, float]] = {}
+                discharge_info: Dict[int, Tuple[float, float]] = {}
+                charge_pool: List[int] = []
+                discharge_pool: List[int] = []
+                dual_pool: List[Tuple[float, float, int]] = []
 
-                by_station: Dict[int, List[int]] = {si: [] for si in range(self.n_stn)}
-                for ei in active_eis:
-                    si = int(self.ev_station_idx[ei])
-                    if si >= 0:
-                        by_station[si].append(int(ei))
-
-                base_idx = sub * self.n_stn
-                for si in range(self.n_stn):
-                    station_eis = by_station.get(si, [])
-                    if not station_eis:
+                for ei in station_eis:
+                    dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
+                    if dt_eff_s <= 0.0:
                         continue
-                    mode = _decode_sign_mode(float(stn_mode_raw[base_idx + si]))
-                    mag = float(stn_mag[base_idx + si])
-                    pch_target = 0.0
-                    pdis_target = 0.0
-                    ranked_ch: List[Tuple[float, int, float]] = []
-                    ranked_dis: List[Tuple[float, int, float]] = []
+                    dt_h_eff = dt_eff_s / 3600.0
+                    ev_obj = self._ev_obj_per_event[int(ei)]
+                    if ev_obj is None:
+                        continue
+                    soc = float(self.event_soc[ei])
+                    cap = float(self.ev_cap_kwh[ei])
+                    ev_obj.soc = soc
+                    remain_s = max(0, int(self.ev_dep_k[ei]) * self.ev_step_s - int(k_global * self.ev_step_s))
+                    wait_s = max(
+                        0,
+                        int(self.event_by_id[self.event_ids[ei]].get("start_t", 0))
+                        - int(self.event_by_id[self.event_ids[ei]].get("arrival_t", 0)),
+                    )
 
-                    for ei in station_eis:
-                        dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
-                        if dt_eff_s <= 0.0:
-                            continue
-                        vi = int(self.ev_vehicle_idx[ei])
-                        if vi < 0:
-                            continue
-                        ev_obj = self._ev_obj_per_event[int(ei)]
-                        if ev_obj is None:
-                            continue
-                        soc = float(self.vehicle_soc[vi])
-                        cap = float(self.ev_cap_kwh[ei])
-                        ev_obj.soc = soc
-                        remain_s = max(0, int(self.ev_dep_k[ei]) * ev_step_s_i - int(k_global * ev_step_s_i))
-                        wait_s = max(0, int(self.event_by_id[self.event_ids[ei]].get("start_t", 0)) - int(self.event_by_id[self.event_ids[ei]].get("arrival_t", 0)))
+                    pmax_ch = max(0.0, min(float(self.ev_pch_max_kw[ei]), float(ev_obj.charge_limit())))
+                    if pmax_ch > 1e-9 and soc < float(self.cfg.ev_target_soc) - 1e-9:
+                        score = _event_priority(ev_obj, soc, wait_s, remain_s)
+                        eta_ch = max(1e-6, float(ev_obj.charge_efficiency(pmax_ch)))
+                        soc_room_kwh = max(0.0, (float(self.cfg.ev_target_soc) - soc) * cap)
+                        p_soc = soc_room_kwh / max(1e-9, eta_ch * dt_h_eff)
+                        cap_kw = min(pmax_ch, p_soc)
+                        if cap_kw > 1e-9:
+                            charge_info[int(ei)] = (score, cap_kw)
 
-                        pch_max = max(0.0, min(float(self.ev_pch_max_kw[ei]), float(ev_obj.charge_limit())))
-                        if pch_max > 1e-9 and soc < min(1.0, float(self.cfg.ev_target_soc)) - 1e-9:
-                            score = _event_priority(ev_obj, soc, wait_s, remain_s)
-                            ranked_ch.append((score, int(ei), pch_max))
-                            pch_target += pch_max
-
-                        dis_ok = bool(self.ev_dis_ok[ei]) and bool(ev_obj.is_v2g(sell_price=price_k))
-                        min_soc_dyn = float(self._ev_v2g_minsoc[ei]) if dis_ok else 0.0
-                        if dis_ok and soc > min_soc_dyn + 1e-9:
-                            energy_margin = max(0.0, (soc - min_soc_dyn) * cap)
-                            dt_h_eff = dt_eff_s / 3600.0
-                            pdis_cap = min(float(self.ev_pdis_max_kw[ei]), energy_margin * float(ev_obj.eta_dis) / max(1e-9, dt_h_eff))
-                            if pdis_cap > 1e-9:
-                                score = _v2g_priority(ev_obj, soc, remain_s)
-                                ranked_dis.append((score, int(ei), pdis_cap))
-                                pdis_target += pdis_cap
-
-                    if mode < 0:
-                        pch_target *= mag
-                        pdis_target = 0.0
-                    else:
-                        pdis_target *= mag
-                        pch_target = 0.0
-
-                    ranked_ch.sort(key=lambda x: (-x[0], x[1]))
-                    ranked_dis.sort(key=lambda x: (-x[0], x[1]))
-
-                    rem = float(pch_target)
-                    for _, ei, pmax in ranked_ch:
-                        if rem <= 1e-9:
-                            break
-                        vi = int(self.ev_vehicle_idx[ei])
-                        if vi < 0:
-                            continue
-                        dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
-                        dt_h_eff = dt_eff_s / 3600.0
-                        soc = float(self.vehicle_soc[vi])
-                        cap = float(self.ev_cap_kwh[ei])
-                        ev_obj = self._ev_obj_per_event[int(ei)]
-                        if ev_obj is None:
-                            continue
-                        ev_obj.soc = soc
-                        eta = max(1e-6, float(ev_obj.charge_efficiency(min(rem, pmax))))
-                        soc_room_kwh = max(0.0, (min(1.0, float(self.cfg.ev_target_soc)) - soc) * cap)
-                        p_soc = soc_room_kwh / max(1e-9, eta * dt_h_eff)
-                        p = min(rem, pmax, p_soc)
-                        if p <= 1e-9:
-                            continue
-                        soc_next = _clamp(soc + (p * eta * dt_h_eff) / max(1e-6, cap), 0.0, 1.0)
-                        if update_states:
-                            self.vehicle_soc[vi] = soc_next
-                        net_kw_avg[ei] += (dt_eff_s / max(1.0, opf_step_s_f)) * p
-                        stn_net_mw[si] += (dt_eff_s / max(1.0, opf_step_s_f)) * (p / 1000.0)
-                        stn_energy_delta_kwh[si] += p * eta * dt_h_eff
-                        rem -= p
-
-                    rem = float(pdis_target)
-                    for _, ei, pmax in ranked_dis:
-                        if rem <= 1e-9:
-                            break
-                        vi = int(self.ev_vehicle_idx[ei])
-                        if vi < 0:
-                            continue
-                        dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
-                        dt_h_eff = dt_eff_s / 3600.0
-                        soc = float(self.vehicle_soc[vi])
-                        cap = float(self.ev_cap_kwh[ei])
-                        ev_obj = self._ev_obj_per_event[int(ei)]
-                        if ev_obj is None:
-                            continue
-                        min_soc_dyn = float(self._ev_v2g_minsoc[ei])
+                    dis_ok = bool(self.ev_dis_ok[ei]) and bool(ev_obj.is_v2g(sell_price=price_k))
+                    min_soc_dyn = float(self._ev_v2g_minsoc[ei]) if dis_ok else 0.0
+                    if dis_ok and soc > min_soc_dyn + 1e-9:
+                        score = _v2g_priority(ev_obj, soc, remain_s)
                         energy_margin = max(0.0, (soc - min_soc_dyn) * cap)
                         p_soc = energy_margin * float(ev_obj.eta_dis) / max(1e-9, dt_h_eff)
-                        p = min(rem, pmax, p_soc)
-                        if p <= 1e-9:
-                            continue
-                        soc_next = _clamp(soc - (p / max(1e-6, float(ev_obj.eta_dis)) * dt_h_eff) / max(1e-6, cap), 0.0, 1.0)
+                        cap_kw = min(float(self.ev_pdis_max_kw[ei]), p_soc)
+                        if cap_kw > 1e-9:
+                            discharge_info[int(ei)] = (score, cap_kw)
+
+                    has_charge = int(ei) in charge_info
+                    has_discharge = int(ei) in discharge_info
+                    if has_charge and not has_discharge:
+                        charge_pool.append(int(ei))
+                    elif has_discharge and not has_charge:
+                        discharge_pool.append(int(ei))
+                    elif has_charge and has_discharge:
+                        dual_pool.append((soc - float(self.cfg.ev_target_soc), discharge_info[int(ei)][0] - charge_info[int(ei)][0], int(ei)))
+
+                charge_cap_total_kw = sum(cap_kw for _, cap_kw in charge_info.values())
+                discharge_cap_total_kw = sum(cap_kw for _, cap_kw in discharge_info.values())
+                charge_ratio = float(np.clip(stn_pch_action[sub, si], 0.0, 1.0))
+                discharge_ratio = float(np.clip(stn_pdis_action[sub, si], 0.0, 1.0))
+                if charge_cap_total_kw <= 1e-9:
+                    charge_ratio = 0.0
+                if discharge_cap_total_kw <= 1e-9:
+                    discharge_ratio = 0.0
+                ratio_sum = charge_ratio + discharge_ratio
+                if ratio_sum > 1.0 + 1e-9:
+                    charge_ratio /= ratio_sum
+                    discharge_ratio /= ratio_sum
+
+                charge_target_kw = charge_ratio * charge_cap_total_kw
+                discharge_target_kw = discharge_ratio * discharge_cap_total_kw
+
+                if discharge_target_kw <= 1e-9:
+                    charge_pool.extend(eid for _, _, eid in dual_pool)
+                elif charge_target_kw <= 1e-9:
+                    discharge_pool.extend(eid for _, _, eid in dual_pool)
+                else:
+                    dual_pool.sort(reverse=True)
+                    discharge_cap = sum(discharge_info[eid][1] for eid in discharge_pool)
+                    for _, _, eid in dual_pool:
+                        if discharge_cap + 1e-9 < discharge_target_kw:
+                            discharge_pool.append(eid)
+                            discharge_cap += discharge_info[eid][1]
+                        else:
+                            charge_pool.append(eid)
+
+                if charge_target_kw > 1e-9 and charge_pool:
+                    weighted_ch = [(charge_info[eid][0], eid, charge_info[eid][1]) for eid in charge_pool]
+                    charge_alloc = _weighted_power_split(weighted_ch, charge_target_kw)
+                    for ei, p in charge_alloc.items():
+                        dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
+                        dt_h_eff = dt_eff_s / 3600.0
+                        ev_obj = self._ev_obj_per_event[int(ei)]
+                        soc = float(self.event_soc[ei])
+                        cap = float(self.ev_cap_kwh[ei])
+                        ev_obj.soc = soc
+                        eta = max(1e-6, float(ev_obj.charge_efficiency(p)))
+                        soc_next = _clamp(soc + (p * eta * dt_h_eff) / max(1e-6, cap), 0.0, 1.0)
                         if update_states:
-                            self.vehicle_soc[vi] = soc_next
-                        net_kw_avg[ei] -= (dt_eff_s / max(1.0, opf_step_s_f)) * p
-                        stn_net_mw[si] -= (dt_eff_s / max(1.0, opf_step_s_f)) * (p / 1000.0)
-                        stn_energy_delta_kwh[si] -= (p / max(1e-6, float(ev_obj.eta_dis))) * dt_h_eff
+                            self.event_soc[ei] = soc_next
+                            if self._trace_enabled and p > 1e-9:
+                                eid = int(self.event_ids[ei])
+                                key = (eid, int(k_global))
+                                self._trace["event_pch_kw"][key] = self._trace["event_pch_kw"].get(key, 0.0) + float(p)
+                                st_key = (int(self.station_ids[si]), int(k_global))
+                                self._trace["st_pch"][st_key] = self._trace["st_pch"].get(st_key, 0.0) + float(p)
+                        net_kw_avg = (dt_eff_s / max(1.0, opf_step_s_f)) * p
+                        ev_pnet_pu[ei] += float(net_kw_avg / 1000.0 / self.baseMVA)
+                        stn_net_mw[si] += float(net_kw_avg / 1000.0)
+
+                if discharge_target_kw > 1e-9 and discharge_pool:
+                    weighted_dis = [(discharge_info[eid][0], eid, discharge_info[eid][1]) for eid in discharge_pool]
+                    discharge_alloc = _weighted_power_split(weighted_dis, discharge_target_kw)
+                    for ei, p in discharge_alloc.items():
+                        dt_eff_s = float(self.ev_dt_slot_s[k_global, ei])
+                        dt_h_eff = dt_eff_s / 3600.0
+                        ev_obj = self._ev_obj_per_event[int(ei)]
+                        soc = float(self.event_soc[ei])
+                        cap = float(self.ev_cap_kwh[ei])
+                        soc_next = _clamp(
+                            soc - (p / max(1e-6, float(ev_obj.eta_dis)) * dt_h_eff) / max(1e-6, cap),
+                            0.0,
+                            1.0,
+                        )
+                        if update_states:
+                            self.event_soc[ei] = soc_next
+                            if self._trace_enabled and p > 1e-9:
+                                eid = int(self.event_ids[ei])
+                                key = (eid, int(k_global))
+                                self._trace["event_pdis_kw"][key] = self._trace["event_pdis_kw"].get(key, 0.0) + float(p)
+                                st_key = (int(self.station_ids[si]), int(k_global))
+                                self._trace["st_pdis"][st_key] = self._trace["st_pdis"].get(st_key, 0.0) + float(p)
+                        net_kw_avg = (dt_eff_s / max(1.0, opf_step_s_f)) * p
+                        ev_pnet_pu[ei] -= float(net_kw_avg / 1000.0 / self.baseMVA)
+                        stn_net_mw[si] -= float(net_kw_avg / 1000.0)
                         v2g_value += float(price_k * p * dt_h_eff)
-                        rem -= p
 
             if update_states:
-                self.station_energy_kwh[:] = np.maximum(0.0, self.station_energy_kwh + stn_energy_delta_kwh)
+                self._propagate_departed_event_soc(k_global + 1)
 
-            for ei in range(self.n_ev):
-                bi = int(self.ev_bus_idx[ei])
-                if bi < 0:
-                    continue
-                ev_pnet_pu[ei] = (float(net_kw_avg[ei]) / 1000.0) / self.baseMVA
+        for ei in range(self.n_ev):
+            bi = int(self.ev_bus_idx[ei])
+            if bi >= 0:
                 P_inj[bi] -= float(ev_pnet_pu[ei])
-
-            now_s_end = (tt + 1) * self.opf_step_s
-            k_end = int(min(self.K_ev, max(0, (tt + 1) * self.Ksub)))
-            for si in range(self.n_stn):
-                due_now = bool(np.any(self.station_due_flag[si, max(0, k_end - self.Ksub + 1):k_end + 1]))
-                if due_now:
-                    due_req_cum = float(self.station_req_cum_kwh[si, k_end])
-                    short_kwh = max(0.0, due_req_cum - float(self.station_energy_kwh[si]))
-                    ev_depart_pen_step += float(self.cfg.ev_depart_penalty) * short_kwh
-
-        self.last_ev_pnet_pu[:] = ev_pnet_pu
         self.last_stn_pnet_mw[:] = stn_net_mw
-        soc_pen += ev_soc_pen
 
-        # Slack exchange
+        k_prev = int(min(self.K_ev, max(0, tt * self.Ksub)))
+        k_end = int(min(self.K_ev, max(0, (tt + 1) * self.Ksub)))
+        ev_depart_pen_step, ev_depart_short_kwh_step = self._event_departure_shortfall_step(k_prev, k_end)
+
         Pd = self.Pd_pu[tt, :]
         Qd = self.Qd_pu[tt, :]
         netP = Pd - P_inj
@@ -727,24 +810,23 @@ class Grid2AIEnv(gym.Env):
         P_buy_pu = float(max(P_req, 0.0))
         P_sell_pu = float(max(-P_req, 0.0))
         Q_grid_pu = float(Q_req)
-
         self.last_P_buy_pu = P_buy_pu
         self.last_P_sell_pu = P_sell_pu
         self.last_Q_grid_pu = Q_grid_pu
+        if update_states and self._trace_enabled:
+            self._trace["P_buy"][tt] = float(P_buy_pu)
+            self._trace["P_sell"][tt] = float(P_sell_pu)
 
         Pcap_pu = float(self.cfg.grid_pmax_mw) / max(1e-12, self.baseMVA)
         Qcap_pu = float(self.cfg.grid_qmax_mvar) / max(1e-12, self.baseMVA)
         P_excess = float(max(0.0, P_buy_pu - Pcap_pu) + max(0.0, P_sell_pu - Pcap_pu))
         Q_excess = float(max(0.0, abs(Q_grid_pu) - Qcap_pu))
-
         self.last_grid_P_excess_pu = P_excess
         self.last_grid_Q_excess_pu = Q_excess
-
         grid_pen = 0.0
-        if (P_excess > 0.0) or (Q_excess > 0.0):
+        if P_excess > 0.0 or Q_excess > 0.0:
             grid_pen = float(self.cfg.grid_limit_penalty) * float(P_excess * P_excess + Q_excess * Q_excess)
 
-        # linear distflow
         subtreeP = netP.copy()
         subtreeQ = netQ.copy()
         Pij = np.zeros((self.ne,), dtype=np.float64)
@@ -753,7 +835,7 @@ class Grid2AIEnv(gym.Env):
             if int(j) == self.slack:
                 continue
             i = int(self.parent[int(j)])
-            eidx = self._edge_index.get((i, int(j)), None)
+            eidx = self._edge_index.get((i, int(j)))
             if eidx is None:
                 continue
             Pij[eidx] = subtreeP[self.bus_to_idx[int(j)]]
@@ -766,7 +848,7 @@ class Grid2AIEnv(gym.Env):
         for i in self._fwd_order:
             for c in self.children.get(int(i), []):
                 j = int(c)
-                eidx = self._edge_index.get((int(i), j), None)
+                eidx = self._edge_index.get((int(i), j))
                 if eidx is None:
                     continue
                 ii = self.bus_to_idx[int(i)]
@@ -778,16 +860,18 @@ class Grid2AIEnv(gym.Env):
             self.Pij[:] = Pij
             self.Qij[:] = Qij
 
-        # penalties
         volt_pen = 0.0
-        if float(self.cfg.v_penalty) > 0:
+        if float(self.cfg.v_penalty) > 0.0:
             for bi, bid in enumerate(self.bus_ids):
                 bus = self.grid.get_bus(int(bid))
                 vmax2 = float(getattr(bus, "Vmax")) ** 2
                 vmin2 = float(getattr(bus, "Vmin")) ** 2
-                Vu = max(0.0, v2[bi] - vmax2)
-                Vl = max(0.0, vmin2 - v2[bi])
-                volt_pen += float(self.cfg.v_penalty) * (Vu + Vl)
+                vu = max(0.0, v2[bi] - vmax2)
+                vl = max(0.0, vmin2 - v2[bi])
+                volt_pen += float(self.cfg.v_penalty) * (vu + vl)
+                if update_states and self._trace_enabled:
+                    self._trace["Vu"][(int(bid), tt)] = float(vu)
+                    self._trace["Vl"][(int(bid), tt)] = float(vl)
 
         br_pen = 0.0
         for k in range(self.ne):
@@ -796,19 +880,15 @@ class Grid2AIEnv(gym.Env):
             if S > lim + 1e-12:
                 br_pen += float(self.cfg.branch_overload_penalty) * ((S - lim) ** 2)
 
-        # objective components
         Pg_MW = Pg_pu * self.baseMVA
         gen_cost = float(np.sum(self.cost_c2 * Pg_MW * Pg_MW + self.cost_c1 * Pg_MW + self.cost_c0)) * float(self.delta_t)
-
         price = float(self.price[tt])
         Pbuy_MW = float(P_buy_pu * self.baseMVA)
         Psell_MW = float(P_sell_pu * self.baseMVA)
         grid_buy_cost = Pbuy_MW * price * float(self.delta_t) * 1000.0
         grid_sell_rev = Psell_MW * price * float(self.delta_t) * 1000.0
-
         curt_MW = curt * self.baseMVA
         curt_cost = float(np.sum(self.ren_curt_cost * curt_MW)) * float(self.delta_t)
-
         v2g_reward = float(self.cfg.v2g_reward_coeff) * float(v2g_value)
 
         step_cost = (
@@ -819,7 +899,6 @@ class Grid2AIEnv(gym.Env):
             + volt_pen
             - v2g_reward
             + br_pen
-            + soc_pen
             + grid_pen
             + ev_depart_pen_step
         )
@@ -830,10 +909,6 @@ class Grid2AIEnv(gym.Env):
             "P_buy_MW": float(Pbuy_MW),
             "P_sell_MW": float(Psell_MW),
             "Q_grid_MVar": float(Q_grid_pu * self.baseMVA),
-            "grid_cap_P_MW": float(self.cfg.grid_pmax_mw),
-            "grid_cap_Q_MVar": float(self.cfg.grid_qmax_mvar),
-            "grid_P_req_pu": float(P_req),
-            "grid_Q_req_pu": float(Q_req),
             "grid_P_excess_pu": float(P_excess),
             "grid_Q_excess_pu": float(Q_excess),
             "grid_pen": float(grid_pen),
@@ -843,7 +918,7 @@ class Grid2AIEnv(gym.Env):
             "curt_cost": float(curt_cost),
             "volt_pen": float(volt_pen),
             "branch_pen": float(br_pen),
-            "soc_pen": float(soc_pen),
+            "ev_depart_short_kwh_step": float(ev_depart_short_kwh_step),
             "ev_depart_pen_step": float(ev_depart_pen_step),
             "v2g_value": float(v2g_value),
             "v2g_reward": float(v2g_reward),
@@ -869,64 +944,64 @@ class Grid2AIEnv(gym.Env):
             pch_cap_mw = 0.0
             pdis_cap_mw = 0.0
             min_rem_h = float(self.horizon_s) / 3600.0
-            due_req_cum_kwh = 0.0
-            short_kwh = 0.0
+            need_kwh = 0.0
+            due_soon_short_kwh = 0.0
 
             if active_n > 0:
-                socs = []
+                socs: List[float] = []
+                due_hi = int(min(self.K_ev, k_global + self.Ksub))
                 for ei in station_eis:
-                    vi = int(self.ev_vehicle_idx[ei])
-                    if vi < 0:
-                        continue
-                    soc = float(self.vehicle_soc[vi])
+                    soc = float(self.event_soc[ei])
                     socs.append(soc)
+                    short_kwh = self._event_target_shortfall_kwh(int(ei))
+                    need_kwh += short_kwh
                     ev_obj = self._ev_obj_per_event[int(ei)]
-                    if ev_obj is not None:
-                        ev_obj.soc = soc
-                        pch_cap_mw += max(0.0, min(float(self.ev_pch_max_kw[ei]), float(ev_obj.charge_limit()))) / 1000.0
-                        if bool(self.ev_dis_ok[ei]) and soc > float(self._ev_v2g_minsoc[ei]) + 1e-9:
-                            pdis_cap_mw += max(0.0, float(self.ev_pdis_max_kw[ei])) / 1000.0
-                    dep_s = int(self.ev_dep_k[ei]) * int(self.ev_step_s)
+                    if ev_obj is None:
+                        continue
+                    ev_obj.soc = soc
+                    pch_cap_mw += max(0.0, min(float(self.ev_pch_max_kw[ei]), float(ev_obj.charge_limit()))) / 1000.0
+                    if bool(self.ev_dis_ok[ei]) and soc > float(self._ev_v2g_minsoc[ei]) + 1e-9:
+                        pdis_cap_mw += max(0.0, float(self.ev_pdis_max_kw[ei])) / 1000.0
+                    dep_k = int(self.ev_dep_k[ei])
+                    if dep_k <= due_hi:
+                        due_soon_short_kwh += short_kwh
+                    dep_s = dep_k * int(self.ev_step_s)
                     rem_h = max(0.0, dep_s - int(k_global * self.ev_step_s)) / 3600.0
                     min_rem_h = min(min_rem_h, rem_h)
                 avg_soc = float(np.mean(socs))
             else:
                 min_rem_h = 0.0
 
-            k_obs = int(min(self.K_ev, max(0, k_global + 1)))
-            due_req_cum_kwh = float(self.station_req_cum_kwh[si, k_obs])
-            short_kwh = max(0.0, due_req_cum_kwh - float(self.station_energy_kwh[si]))
+            pnet_cap = max(0.25, pch_cap_mw, pdis_cap_mw)
+            pnet_norm = _clamp(float(self.last_stn_pnet_mw[si]) / pnet_cap, -1.0, 1.0)
 
             feats[si, 0] = _clamp(float(active_n) / 50.0, 0.0, 1.0)
             feats[si, 1] = _clamp(avg_soc, 0.0, 1.0)
             feats[si, 2] = _clamp(pch_cap_mw / 1.0, 0.0, 1.0)
             feats[si, 3] = _clamp(pdis_cap_mw / 1.0, 0.0, 1.0)
             feats[si, 4] = _clamp(min_rem_h / 24.0, 0.0, 1.0)
-            feats[si, 5] = _clamp((float(self.last_stn_pnet_mw[si]) + 1.0) / 2.0, 0.0, 1.0)
-            feats[si, 6] = _clamp(due_req_cum_kwh / 2000.0, 0.0, 1.0)
-            feats[si, 7] = _clamp(short_kwh / 2000.0, 0.0, 1.0)
+            feats[si, 5] = 0.5 * (pnet_norm + 1.0)
+            feats[si, 6] = _clamp(need_kwh / 2000.0, 0.0, 1.0)
+            feats[si, 7] = _clamp(due_soon_short_kwh / 2000.0, 0.0, 1.0)
         return feats
 
     def _get_obs(self) -> np.ndarray:
-        tt = int(self._t)
+        tt = int(min(self._t, self.T - 1))
         t_sec = tt * self.opf_step_s
-
         frac = float(t_sec) / float(max(1, self.horizon_s))
         time_sin = math.sin(2.0 * math.pi * frac)
         time_cos = math.cos(2.0 * math.pi * frac)
 
         pmin = float(np.min(self.price)) if self.T > 0 else 0.0
         pmax = float(np.max(self.price)) if self.T > 0 else 1.0
-        price_n = self._norm(float(self.price[min(tt, self.T - 1)]), pmin, pmax)
+        price_n = self._norm(float(self.price[tt]), pmin, pmax)
 
         obs: List[float] = [float(time_sin), float(time_cos), float(price_n)]
-
         vm_min = float(self.cfg.obs_vm_min)
         vm_max = float(self.cfg.obs_vm_max)
 
-        Pd = self.Pd_pu[min(tt, self.T - 1), :]
-        Qd = self.Qd_pu[min(tt, self.T - 1), :]
-
+        Pd = self.Pd_pu[tt, :]
+        Qd = self.Qd_pu[tt, :]
         for bi in range(self.nb):
             vm = math.sqrt(max(0.0, float(self.v2[bi])))
             obs.append(self._norm(vm, vm_min, vm_max))
@@ -939,24 +1014,24 @@ class Grid2AIEnv(gym.Env):
 
         for ri in range(self.n_ren):
             obs.append(_clamp(2.0 * float(self.last_ren_frac[ri]) - 1.0, -1.0, 1.0))
-            obs.append(_clamp(float(self.Pav_pu[min(tt, self.T - 1), ri]) / 1.0, -1.0, 1.0))
+            obs.append(_clamp(float(self.Pav_pu[tt, ri]) / 1.0, -1.0, 1.0))
 
         for si in range(self.n_sto):
-            pcap = max(1e-12, max(float(self.sto_Pch_max[si]), float(self.sto_Pdis_max[si])) / self.baseMVA)
+            pcap = max(1e-12, max(float(self.sto_Pch_max_mw[si]), float(self.sto_Pdis_max_mw[si])) / self.baseMVA)
             obs.append(_clamp(float(self.last_sto_pnet_pu[si]) / pcap, -1.0, 1.0))
             obs.append(_clamp(2.0 * float(self.sto_soc[si]) - 1.0, -1.0, 1.0))
 
         k_global = min(max(tt * self.Ksub, 0), max(0, self.K_ev - 1))
         st_feats = self._station_obs_features(k_global)
         for si in range(self.n_stn):
-            obs.append(_clamp(2.0 * float(st_feats[si, 0]) - 1.0, -1.0, 1.0))  # active EV count
-            obs.append(_clamp(2.0 * float(st_feats[si, 1]) - 1.0, -1.0, 1.0))  # avg SOC
-            obs.append(_clamp(2.0 * float(st_feats[si, 2]) - 1.0, -1.0, 1.0))  # charge headroom
-            obs.append(_clamp(2.0 * float(st_feats[si, 3]) - 1.0, -1.0, 1.0))  # discharge headroom
-            obs.append(_clamp(2.0 * float(st_feats[si, 4]) - 1.0, -1.0, 1.0))  # min remaining time
-            obs.append(_clamp(2.0 * float(st_feats[si, 5]) - 1.0, -1.0, 1.0))  # last station net load
-            obs.append(_clamp(2.0 * float(st_feats[si, 6]) - 1.0, -1.0, 1.0))  # cumulative due demand
-            obs.append(_clamp(2.0 * float(st_feats[si, 7]) - 1.0, -1.0, 1.0))  # current shortfall
+            obs.append(_clamp(2.0 * float(st_feats[si, 0]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 1]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 2]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 3]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 4]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 5]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 6]) - 1.0, -1.0, 1.0))
+            obs.append(_clamp(2.0 * float(st_feats[si, 7]) - 1.0, -1.0, 1.0))
 
         return np.asarray(obs, dtype=np.float32)
 
@@ -965,15 +1040,17 @@ class Grid2AIEnv(gym.Env):
         vms = np.sqrt(np.maximum(0.0, self.v2))
         print(
             f"[t={tt}/{self.T}] Vm(min/mean/max)={float(np.min(vms)):.4f}/{float(np.mean(vms)):.4f}/{float(np.max(vms)):.4f} "
-            f"| P_buy={self.last_P_buy_pu*self.baseMVA:.3f}MW P_sell={self.last_P_sell_pu*self.baseMVA:.3f}MW "
-            f"| cap_excess(P,Q)=({self.last_grid_P_excess_pu*self.baseMVA:.3f}MW, {self.last_grid_Q_excess_pu*self.baseMVA:.3f}MVar)"
+            f"| P_buy={self.last_P_buy_pu * self.baseMVA:.3f}MW P_sell={self.last_P_sell_pu * self.baseMVA:.3f}MW "
+            f"| cap_excess(P,Q)=({self.last_grid_P_excess_pu * self.baseMVA:.3f}MW, {self.last_grid_Q_excess_pu * self.baseMVA:.3f}MVar)"
         )
 
     def close(self):
         return
 
+
 def register_envs() -> None:
     register(id="Grid2AI-v0", entry_point="env.environment:Grid2AIEnv")
+
 
 def make_env(
     grid_yaml: str = "config/IEEE33.yaml",

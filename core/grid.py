@@ -1,12 +1,10 @@
 import yaml
 import numpy as np
-from bisect import bisect_right
 from dataclasses import dataclass, field
 from collections import deque
 from typing import List, Dict, Optional, Tuple, Any
 from core import Bus, Branch, Generator
 from DERs import Renewable, Storage, EV, Station, ChargingEvent
-from components import NOP, SOP
 from utils import get_series_value
 
 @dataclass
@@ -21,10 +19,7 @@ class Grid:
     stations: List[Station] = field(default_factory=list)
     evs: List[EV] = field(default_factory=list)
     events: List[ChargingEvent] = field(default_factory=list)
-    nops: List[NOP] = field(default_factory=list)
-    sops: List[SOP] = field(default_factory=list)
     scale_path: str = "config/time.yaml"
-    renewable_profile_path: str = "config/renewable_profiles.yaml"
     renewable_profiles: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     _ybus_cache: Optional[np.ndarray] = field(default=None, init=False, repr=False)
 
@@ -68,12 +63,6 @@ class Grid:
     def next_event_i(self) -> int:
         return self._next_id(self.events, "event_i", start=1)
 
-    def next_nop_i(self) -> int:
-        return self._next_id(self.nops, "nop_i", start=1)
-
-    def next_sop_i(self) -> int:
-        return self._next_id(self.sops, "sop_i", start=1)
-
     # 2. ID validation methods
     def _validate_unique_bus_ids(self) -> None:
         ids = [b.bus_i for b in self.buses]
@@ -114,16 +103,6 @@ class Grid:
         ids = [ev.event_i for ev in self.events]
         if len(ids) != len(set(ids)):
             raise ValueError("Duplicate event_i found in Grid.events")
-    
-    def _validate_unique_nop_ids(self) -> None:
-        ids = [n.nop_i for n in self.nops]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Duplicate nop_i found in Grid.nops")
-    
-    def _validate_unique_sop_ids(self) -> None:
-        ids = [so.sop_i for so in self.sops]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Duplicate sop_i found in Grid.sops")
 
     def validate_references(self) -> None:
         bus_set = {b.bus_i for b in self.buses}
@@ -142,13 +121,6 @@ class Grid:
         for st in self.stations:
             if st.bus_i not in bus_set:
                 raise ValueError(f"Station {st.station_i} refers to missing bus: bus_i={st.bus_i}")
-        for so in self.sops:
-            if so.f_bus not in bus_set or so.t_bus not in bus_set:
-                raise ValueError(f"Sop {so.sop_i} refers to missing bus: from={so.f_bus}, to={so.t_bus}")
-        branch_set = {br.branch_i for br in self.branches}
-        for n in self.nops:
-            if n.branch_i not in branch_set:
-                raise ValueError(f"Nop {n.nop_i} refers to missing branch: branch_i={n.branch_i}")
         station_set = {st.station_i for st in self.stations}
         ev_set = {e.ev_i for e in self.evs}
         for ev in self.events:
@@ -172,12 +144,9 @@ class Grid:
         stations = Station.load_from_yaml(path)
         evs = EV.load_from_yaml(path)
         events = ChargingEvent.load_from_yaml(path)
-        nops = NOP.load_from_yaml(path)
-        sops = SOP.load_from_yaml(path)
 
         grid = Grid(baseMVA=base_mva, buses=buses, branches=branches, generators=generators, renewables=renewables, storages=storages,
-                    stations=stations, evs=evs, events=events, nops=nops, sops=sops)
-        grid.renewable_profiles = grid._load_renewable_profiles(grid.renewable_profile_path)
+                    stations=stations, evs=evs, events=events)
         grid._validate_unique_bus_ids()
         grid._validate_unique_branch_ids()
         grid._validate_unique_gen_ids()
@@ -186,28 +155,8 @@ class Grid:
         grid._validate_unique_station_ids()
         grid._validate_unique_ev_ids()
         grid._validate_unique_event_ids()
-        grid._validate_unique_nop_ids()
-        grid._validate_unique_sop_ids()
         grid.validate_references()
         return grid
-
-    @staticmethod
-    def _load_renewable_profiles(path: str) -> Dict[int, Dict[str, Any]]:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-        except FileNotFoundError:
-            return {}
-        profiles = cfg.get("renewable_profiles", {})
-        if not isinstance(profiles, dict):
-            return {}
-        out: Dict[int, Dict[str, Any]] = {}
-        for rid, prof in profiles.items():
-            try:
-                out[int(rid)] = dict(prof)
-            except Exception:
-                continue
-        return out
 
     def save_to_yaml(self, path: str) -> None:
         cfg = {
@@ -220,8 +169,6 @@ class Grid:
             "stations": Station.to_grid(self.stations),
             "evs": EV.to_grid(self.evs),
             "events": ChargingEvent.to_grid(self.events),
-            "nops": NOP.to_grid(self.nops),
-            "sops": SOP.to_grid(self.sops),
         }
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True, default_flow_style=False, width=1000)
@@ -258,12 +205,6 @@ class Grid:
 
     def get_event(self, event_i: int) -> Optional[ChargingEvent]:
         return next((ev for ev in self.events if ev.event_i == event_i), None)
-    
-    def get_nop(self, nop_i: int) -> Optional[NOP]:
-        return next((n for n in self.nops if n.nop_i == nop_i), None)
-
-    def get_sop(self, sop_i: int) -> Optional[SOP]:
-        return next((so for so in self.sops if so.sop_i == sop_i), None)
 
     def get_generators(self, bus_i: int) -> List[Generator]:
         return [g for g in self.generators if g.bus_i == bus_i and g.status == 1]
@@ -374,10 +315,6 @@ class Grid:
             return self.get_ev(item_id)
         if k in {"event", "events", "chargingevent", "chargingevents"}:
             return self.get_event(item_id)
-        if k in {"nop", "nops"}:
-            return self.get_nop(item_id)
-        if k in {"sop", "sops"}:
-            return self.get_sop(item_id)
         raise KeyError(f"Unknown kind: {kind!r}")
 
     def remove_item(self, kind: str, item_id: int, **kwargs) -> None:
@@ -398,10 +335,6 @@ class Grid:
             return self.remove_ev(item_id, **kwargs)
         if k in {"event", "events", "chargingevent", "chargingevents"}:
             return self.remove_event(item_id)
-        if k in {"nop", "nops"}:
-            return self.remove_nop(item_id)
-        if k in {"sop", "sops"}:
-            return self.remove_sop(item_id)
         raise KeyError(f"Unknown kind: {kind!r}")
 
     @staticmethod
@@ -652,77 +585,11 @@ class Grid:
             raise KeyError(f"Event {event_i} not found")
         self.events = [c for c in self.events if c.event_i != event_i]
 
-    def add_nop(self, n: NOP, *, overwrite: bool = False) -> None:
-        if not any(br.branch_i == n.branch_i for br in self.branches):
-            raise ValueError(f"NOP {n.nop_i} refers to missing branch {n.branch_i}")
-        existing = self.get_nop(n.nop_i)
-        if existing is not None and not overwrite:
-            raise ValueError(f"NOP {n.nop_i} already exists.")
-        if existing is not None and overwrite:
-            self.nops = [x for x in self.nops if x.nop_i != n.nop_i]
-        self.nops.append(n)
-        self._validate_unique_nop_ids()
-        self.invalidate_cache()
-
-    def update_nop(self, nop_i: int, **fields) -> None:
-        n = self.get_nop(nop_i)
-        if n is None:
-            raise KeyError(f"NOP {nop_i} not found")
-        for k, v in fields.items():
-            if not hasattr(n, k):
-                raise AttributeError(f"NOP has no attribute '{k}'")
-            setattr(n, k, v)
-        if hasattr(n, "branch_i") and not any(br.branch_i == n.branch_i for br in self.branches):
-            raise ValueError(f"NOP {nop_i} refers to missing branch {n.branch_i}")
-        self.invalidate_cache()
-
-    def remove_nop(self, nop_i: int) -> None:
-        if not any(n.nop_i == nop_i for n in self.nops):
-            raise KeyError(f"NOP {nop_i} not found")
-        self.nops = [n for n in self.nops if n.nop_i != nop_i]
-        self.invalidate_cache()
-
-    def add_sop(self, so: SOP, *, overwrite: bool = False) -> None:
-        bus_set = {b.bus_i for b in self.buses}
-        if so.f_bus not in bus_set or so.t_bus not in bus_set:
-            raise ValueError(f"SOP {so.sop_i} refers to missing bus")
-        existing = self.get_sop(so.sop_i)
-        if existing is not None and not overwrite:
-            raise ValueError(f"SOP {so.sop_i} already exists.")
-        if existing is not None and overwrite:
-            self.sops = [x for x in self.sops if x.sop_i != so.sop_i]
-
-        self.sops.append(so)
-        self._validate_unique_sop_ids()
-        self.invalidate_cache()
-
-    def update_sop(self, sop_i: int, **fields) -> None:
-        so = self.get_sop(sop_i)
-        if so is None:
-            raise KeyError(f"SOP {sop_i} not found")
-        for k, v in fields.items():
-            if not hasattr(so, k):
-                raise AttributeError(f"SOP has no attribute '{k}'")
-            setattr(so, k, v)
-        bus_set = {b.bus_i for b in self.buses}
-        if hasattr(so, "f_bus") and so.f_bus not in bus_set:
-            raise ValueError(f"SOP {sop_i} refers to missing bus: f_bus={so.f_bus}")
-        if hasattr(so, "t_bus") and so.t_bus not in bus_set:
-            raise ValueError(f"SOP {sop_i} refers to missing bus: t_bus={so.t_bus}")
-        self.invalidate_cache()
-
-    def remove_sop(self, sop_i: int) -> None:
-        if not any(so.sop_i == sop_i for so in self.sops):
-            raise KeyError(f"SOP {sop_i} not found")
-        self.sops = [so for so in self.sops if so.sop_i != sop_i]
-        self.invalidate_cache()
-
     def remove_bus(self, bus_i: int, *, remove_attached: bool = True) -> None:
         if self.get_bus(bus_i) is None:
             raise KeyError(f"Bus {bus_i} not found")
 
         if remove_attached:
-            self.sops = [so for so in self.sops if so.f_bus != bus_i and so.t_bus != bus_i]
             station_ids = {st.station_i for st in self.stations if st.bus_i == bus_i}
             if station_ids:
                 self.events = [ev for ev in self.events if ev.station_i not in station_ids]
@@ -730,14 +597,8 @@ class Grid:
             self.generators = [g for g in self.generators if g.bus_i != bus_i]
             self.renewables = [r for r in self.renewables if r.bus_i != bus_i]
             self.storages = [s for s in self.storages if s.bus_i != bus_i]
-            removed_branch_ids = {br.branch_i for br in self.branches if br.f_bus == bus_i or br.t_bus == bus_i}
             self.branches = [br for br in self.branches if br.f_bus != bus_i and br.t_bus != bus_i]
-            if removed_branch_ids:
-                self.nops = [n for n in self.nops if n.branch_i not in removed_branch_ids]
         else:
-            for so in self.sops:
-                if so.f_bus == bus_i or so.t_bus == bus_i:
-                    raise ValueError(f"Cannot remove bus {bus_i}: sop {so.sop_i} still attached")
             for st in self.stations:
                 if st.bus_i == bus_i:
                     raise ValueError(f"Cannot remove bus {bus_i}: station {st.station_i} still attached")
@@ -783,39 +644,13 @@ class Grid:
         prof = profiles.get(int(renewable_i))
         if not isinstance(prof, dict):
             return float(r.Pmax)
-        series = prof.get("series")
-        if isinstance(series, list) and series:
-            times: List[int] = []
-            values: List[float] = []
-            for item in series:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    times.append(int(item.get("time", 0)))
-                    values.append(float(item.get("value", 0.0)))
-                except Exception:
-                    continue
-            if times and values and len(times) == len(values):
-                if len(times) >= 2:
-                    step = min(max(1, times[i + 1] - times[i]) for i in range(len(times) - 1))
-                else:
-                    step = 86400
-                horizon = int(times[-1]) + int(step)
-                tt = max(0, int(t))
-                idx = bisect_right(times, tt % horizon) - 1
-                if idx < 0:
-                    idx = 0
-                elif idx >= len(values):
-                    idx = len(values) - 1
-                pu = values[int(idx)]
-                return float(r.Pmax) * max(0.0, min(1.2, pu))
         daily = prof.get("daily_pu")
-        if isinstance(daily, list) and len(daily) == 96:
-            t_sec = max(0, int(t))
-            idx = (t_sec % 86400) // 900
-            pu = float(daily[int(idx)])
-            return float(r.Pmax) * max(0.0, min(1.2, pu))
-        return float(r.Pmax)
+        if not isinstance(daily, list) or len(daily) != 96:
+            return float(r.Pmax)
+        t_sec = max(0, int(t))
+        idx = (t_sec % 86400) // 900  
+        pu = float(daily[int(idx)])
+        return float(r.Pmax) * pu
 
     def renewable_pav_pu(self, renewable_i: int, *, t: int) -> float:
         pav_mw = self.renewable_pav_mw(renewable_i, t=t)
@@ -858,15 +693,8 @@ class Grid:
             raise ValueError("Grid has no buses.")
         idx = self.bus_index
         Y = np.zeros((nb, nb), dtype=complex)
-        nop_branch_ids = set()
-        for n in (getattr(self, "nops", []) or []):
-            bid = getattr(n, "branch_i", getattr(n, "br_i", None))
-            if bid is None:
-                continue
-            nop_branch_ids.add(int(bid))
         for br in self.branches:
-            br_id = int(getattr(br, "branch_i", getattr(br, "br_i", -1)))
-            if br.status != 1 and br_id not in nop_branch_ids:
+            if br.status != 1:
                 continue
             y = self.branch_y_pu(br)
             i = idx[br.f_bus]

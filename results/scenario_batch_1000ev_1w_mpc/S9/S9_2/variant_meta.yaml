@@ -1,0 +1,5 @@
+scenario_base: S9
+scenario: S9_2
+seed: 153
+lookahead_hours: 24
+rolling_interval_minutes: 360

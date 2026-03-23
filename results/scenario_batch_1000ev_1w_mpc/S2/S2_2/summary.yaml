@@ -1,0 +1,29 @@
+objective: 4865235.4433
+gen_cost: 1606080.0004
+grid_cost: 1369301.8471
+curt_cost: -0.0006
+volt_pen: 0.0000
+storage_terminal_value: 6201.7269
+ev_depart_penalty: 2072616.8556
+v2g_reward: 176561.5323
+voltage_penalty_coeff: 10000.0000
+storage_terminal_value_coeff: 1.0000
+ev_unmet_kwh: 103630.8428
+event_served: 11124.0000
+v2g_capable_evs: 687.0000
+v2g_active_evs: 456.0000
+v2g_capable_events: 4285.0000
+v2g_active_events: 2103.0000
+v2g_energy_kwh: 30990.6611
+avg_depart_soc_v2g: 0.7630
+avg_depart_soc_v2g_active: 0.7264
+avg_depart_soc_non_v2g: 0.8248
+v2g_capable_events_by_type:
+  BUS: 619.0000
+  V2G: 3666.0000
+v2g_active_events_by_type:
+  BUS: 580.0000
+  V2G: 1523.0000
+max_v2g_relief_mw: 2.7515
+avg_v2g_discharge_mw: 0.2005
+precharge_like_slots: 67.0000

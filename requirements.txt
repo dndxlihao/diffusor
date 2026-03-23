@@ -1,0 +1,23 @@
+# Core numerical and config dependencies
+numpy
+PyYAML
+
+# Optimization
+pyomo
+
+# Environment and RL training
+gymnasium
+stable-baselines3
+torch
+tensorboard
+tqdm
+rich
+
+# Plotting and analysis
+matplotlib
+
+# Notes:
+# 1. The OPF scripts default to `solver_name="gurobi"` in Pyomo config.
+#    If you use that default, install and license Gurobi separately.
+# 2. Solver executables/interfaces such as Gurobi, CBC, GLPK, or IPOPT are
+#    external dependencies and are not covered by this file.
